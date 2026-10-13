@@ -37,3 +37,12 @@ def test_phase3_d65_identity_and_vector_panels() -> None:
         svg = (STILLS / name).read_text(encoding="utf-8")
         assert 'viewBox="0 0 4000 2250"' in svg
         assert svg.count("<polygon ") == result["svg_triangle_count_per_panel"]
+
+
+def test_bear_river_bay_crops_are_native_frame_scale() -> None:
+    result = report()["bear_river_bay_crop"]
+    assert result["crop_size_px"] == [600, 600]
+    assert result["scale"].startswith("100%")
+    assert Image.open(STILLS / "bear_river_bay_d65_600.png").size == (600, 600)
+    assert Image.open(STILLS / "bear_river_bay_2856k_600.png").size == (600, 600)
+    assert Image.open(STILLS / "bear_river_bay_crops.png").size == (1212, 600)
