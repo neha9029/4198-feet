@@ -38,3 +38,22 @@ def test_seeded_solver_is_deterministic_and_complete() -> None:
     assert result["metamers"]["repeat_success_pattern_equal"] is True
     assert result["metamers"]["final"]["failure_rate"] == 0.0
     assert result["tests_pass"] is True
+
+
+def test_daylight_camouflage_and_six_reveal_trials() -> None:
+    metamers = report()["metamers"]
+    camouflage = metamers["d65_camouflage"]
+    assert camouflage["passes_target"] is True
+    assert camouflage["median_delta_e76_d65_lost_to_land"] < 3.0
+    assert len(metamers["option_sweep"]) == 6
+    assert {row["smoothness_weight"] for row in metamers["option_sweep"]} == {
+        50.0,
+        100.0,
+        200.0,
+    }
+
+
+def test_render_crop_has_no_nodata_triangles() -> None:
+    mesh = report()["mesh"]
+    assert mesh["valid_data_crop"]["contains_nodata"] is False
+    assert mesh["class_triangle_counts"]["nodata"] == 0

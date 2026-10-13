@@ -20,6 +20,9 @@ def _write_report(seed: int, mesh: dict, metamers: dict, render: dict) -> dict:
         and metamers["final"]["failure_rate"] == 0.0
         and metamers["final"]["spectra_min"] >= metamers["bounds"][0] - 1e-8
         and metamers["final"]["spectra_max"] <= metamers["bounds"][1] + 1e-8
+        and metamers["d65_camouflage"]["passes_target"]
+        and mesh["valid_data_crop"]["contains_nodata"] is False
+        and mesh["class_triangle_counts"]["nodata"] == 0
         and render["d65_identity"]
     )
     report = {

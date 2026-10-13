@@ -28,6 +28,39 @@ def _edge(mask: np.ndarray) -> np.ndarray:
     return mask ^ ndimage.binary_erosion(mask)
 
 
+def _largest_valid_rectangle(valid: np.ndarray) -> tuple[int, int, int, int]:
+    """Find the largest axis-aligned rectangle inside the contiguous data footprint."""
+    row_has_data = valid.any(axis=1)
+    left = np.where(row_has_data, np.argmax(valid, axis=1), valid.shape[1])
+    right = np.where(
+        row_has_data,
+        valid.shape[1] - np.argmax(valid[:, ::-1], axis=1),
+        0,
+    )
+    best_area = 0
+    best = (0, valid.shape[0], 0, valid.shape[1])
+    for top in range(valid.shape[0]):
+        if not row_has_data[top]:
+            continue
+        common_left = 0
+        common_right = valid.shape[1]
+        for bottom in range(top, valid.shape[0]):
+            if not row_has_data[bottom]:
+                break
+            common_left = max(common_left, int(left[bottom]))
+            common_right = min(common_right, int(right[bottom]))
+            if common_left >= common_right:
+                break
+            area = (bottom - top + 1) * (common_right - common_left)
+            if area > best_area:
+                best_area = area
+                best = (top, bottom + 1, common_left, common_right)
+    row0, row1, col0, col1 = best
+    if not valid[row0:row1, col0:col1].all():
+        raise RuntimeError("Computed render crop contains source no-data")
+    return best
+
+
 def _sample_weighted_points(
     occurrence: np.ndarray,
     classes: np.ndarray,
@@ -143,6 +176,15 @@ def build_mesh(seed: int = SEED) -> dict:
     with rasterio.open(DATA_DIR / "gsl_lost_depth_ft_utm12.tif") as dataset:
         lost_depth = dataset.read(1)
 
+    original_shape = classes.shape
+    crop_window = _largest_valid_rectangle(
+        np.isfinite(occurrence) & (classes != 255)
+    )
+    row0, row1, col0, col1 = crop_window
+    occurrence = occurrence[row0:row1, col0:col1]
+    classes = classes[row0:row1, col0:col1]
+    lost_depth = lost_depth[row0:row1, col0:col1]
+
     interior = _sample_weighted_points(occurrence, classes, rng)
     relaxed = lloyd_relax(interior, LLOYD_ITERATIONS)
     anchors = _shoreline_points(classes, rng)
@@ -167,6 +209,8 @@ def build_mesh(seed: int = SEED) -> dict:
         occurrence=triangle_occurrence,
         mixed=mixed,
         raster_shape=np.array(classes.shape, dtype=np.int32),
+        original_raster_shape=np.array(original_shape, dtype=np.int32),
+        crop_window=np.array(crop_window, dtype=np.int32),
     )
     report = {
         "seed": seed,
@@ -174,6 +218,13 @@ def build_mesh(seed: int = SEED) -> dict:
         "triangles": int(len(simplices)),
         "lloyd_iterations": LLOYD_ITERATIONS,
         "shoreline_anchors": int(len(anchors)),
+        "valid_data_crop": {
+            "original_raster_shape": list(original_shape),
+            "window_row0_row1_col0_col1": list(crop_window),
+            "cropped_raster_shape": list(classes.shape),
+            "contains_nodata": bool(np.any(classes == 255)),
+            "frame_boundary_points": FRAME_SAMPLES_PER_EDGE * 4,
+        },
         "mixed_class_triangles": int(mixed.sum()),
         "mixed_class_fraction_of_valid": mixed_fraction,
         "class_boundary_mixed_fraction_of_valid": contour_fraction,
