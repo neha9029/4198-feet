@@ -30,7 +30,7 @@ def test_c1_is_confirmed_and_only_approved_candidates_are_managed() -> None:
 def test_managed_class_is_distinct_and_recalibration_is_within_tolerance() -> None:
     result = report()
     final = json.loads(
-        (ROOT / "out" / "phase1" / "managed_decision_report.json").read_text(
+        (ROOT / "out" / "phase1" / "managed_aoi_report.json").read_text(
             encoding="utf-8"
         )
     )

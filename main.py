@@ -9,6 +9,7 @@ from data import run_phase1
 from phase1_checks import run_phase1_checks
 from phase1_managed import run_phase1_managed
 from phase1_decision import run_managed_decision
+from phase1_aoi import run_managed_aoi
 from phase2 import run_phase2
 
 
@@ -22,6 +23,7 @@ def main() -> None:
             "phase1-checks",
             "phase1-managed",
             "phase1-decision",
+            "phase1-aoi",
             "phase2",
         ),
     )
@@ -34,6 +36,8 @@ def main() -> None:
         print(json.dumps(run_phase1_managed(), indent=2))
     elif args.phase == "phase1-decision":
         print(json.dumps(run_managed_decision(), indent=2))
+    elif args.phase == "phase1-aoi":
+        print(json.dumps(run_managed_aoi(), indent=2))
     elif args.phase == "phase2":
         print(json.dumps(run_phase2(), indent=2))
 
