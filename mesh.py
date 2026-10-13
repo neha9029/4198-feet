@@ -9,24 +9,25 @@ import numpy as np
 import rasterio
 from scipy import ndimage
 from scipy.spatial import Delaunay
-from rasterio.warp import transform as warp_transform
 
-from data import (
-    CAUSEWAY_LAT,
-    CAUSEWAY_REFERENCE_LON,
-    DATA_DIR,
-    MEASUREMENT_CRS,
-    SEED,
+from causeway import (
+    BEAR_RIVER_BAY_WGS84,
+    FARMINGTON_BAY_WGS84,
+    classify_grid,
+    classify_wgs84,
+    source_metadata,
 )
+from data import DATA_DIR, SEED
 from engine import lloyd_relax
 
 
-INTERIOR_POINTS = 2_100
+INTERIOR_POINTS = 2_900
 SHORELINE_ANCHORS = 800
 FRAME_SAMPLES_PER_EDGE = 34
 LLOYD_ITERATIONS = 2
 DENSITY_STRIDE = 8
-HEALTHY_CROP_MARGIN = 0.06
+LAKE_FRAME_HEIGHT_FRACTION = 0.92
+FRAME_ASPECT_RATIO = 16.0 / 9.0
 MESH_PATH = DATA_DIR / "gsl_mesh_phase2.npz"
 MESH_REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "mesh_report.json"
 
@@ -69,29 +70,58 @@ def _largest_valid_rectangle(valid: np.ndarray) -> tuple[int, int, int, int]:
     return best
 
 
-def _tight_healthy_crop(
+def _wide_frame(
+    occurrence: np.ndarray,
     classes: np.ndarray,
-    valid: np.ndarray,
-    margin_fraction: float = HEALTHY_CROP_MARGIN,
-) -> tuple[int, int, int, int]:
-    """Bound the 4,198 ft extent with a six-percent margin on every side."""
+    lost_depth: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int, int], dict]:
+    """Place source rasters in a north-up 16:9 land-texture frame."""
     rows, columns = np.where(np.isin(classes, (1, 2)))
     if not len(rows):
         raise RuntimeError("Healthy lake extent is empty")
-    height = int(rows.max() - rows.min() + 1)
-    width = int(columns.max() - columns.min() + 1)
-    row_margin = int(np.ceil(height * margin_fraction))
-    column_margin = int(np.ceil(width * margin_fraction))
-    window = (
-        max(0, int(rows.min()) - row_margin),
-        min(classes.shape[0], int(rows.max()) + row_margin + 1),
-        max(0, int(columns.min()) - column_margin),
-        min(classes.shape[1], int(columns.max()) + column_margin + 1),
+    healthy_height = int(rows.max() - rows.min() + 1)
+    frame_height = int(np.ceil(healthy_height / LAKE_FRAME_HEIGHT_FRACTION))
+    frame_width = int(round(frame_height * FRAME_ASPECT_RATIO))
+    centre_row = (float(rows.min()) + float(rows.max()) + 1.0) / 2.0
+    centre_column = (float(columns.min()) + float(columns.max()) + 1.0) / 2.0
+    row0 = int(round(centre_row - frame_height / 2.0))
+    col0 = int(round(centre_column - frame_width / 2.0))
+    row1, col1 = row0 + frame_height, col0 + frame_width
+
+    frame_occurrence = np.zeros((frame_height, frame_width), dtype=np.float32)
+    frame_classes = np.zeros((frame_height, frame_width), dtype=np.uint8)
+    frame_depth = np.zeros((frame_height, frame_width), dtype=np.float32)
+    synthetic = np.ones((frame_height, frame_width), dtype=bool)
+
+    source_row0, source_row1 = max(0, row0), min(classes.shape[0], row1)
+    source_col0, source_col1 = max(0, col0), min(classes.shape[1], col1)
+    target_row0, target_row1 = source_row0 - row0, source_row1 - row0
+    target_col0, target_col1 = source_col0 - col0, source_col1 - col0
+    source_slice = np.s_[source_row0:source_row1, source_col0:source_col1]
+    target_slice = np.s_[target_row0:target_row1, target_col0:target_col1]
+    valid = np.isfinite(occurrence[source_slice]) & (classes[source_slice] != 255)
+    frame_occurrence[target_slice] = np.where(
+        valid, occurrence[source_slice], 0.0
     )
-    row0, row1, col0, col1 = window
-    if not valid[row0:row1, col0:col1].all():
-        raise RuntimeError("Tight healthy-extent crop intersects source no-data")
-    return window
+    frame_classes[target_slice] = np.where(valid, classes[source_slice], 0)
+    frame_depth[target_slice] = np.where(valid, lost_depth[source_slice], 0.0)
+    synthetic[target_slice] = ~valid
+    metadata = {
+        "healthy_extent_height_pixels": healthy_height,
+        "frame_height_pixels": frame_height,
+        "frame_width_pixels": frame_width,
+        "healthy_extent_frame_height_fraction": healthy_height / frame_height,
+        "aspect_ratio_width_over_height": frame_width / frame_height,
+        "source_valid_pixel_fraction": float(np.mean(~synthetic)),
+    }
+    return (
+        frame_occurrence,
+        frame_classes,
+        frame_depth,
+        synthetic,
+        (row0, row1, col0, col1),
+        metadata,
+    )
 
 
 def _sample_weighted_points(
@@ -209,29 +239,24 @@ def build_mesh(seed: int = SEED) -> dict:
         lost_depth = dataset.read(1)
 
     original_shape = classes.shape
-    _, causeway_y = warp_transform(
-        "EPSG:4326",
-        MEASUREMENT_CRS,
-        [CAUSEWAY_REFERENCE_LON],
-        [CAUSEWAY_LAT],
-    )
-    row_y = class_transform.f + (
-        np.arange(original_shape[0]) + 0.5
-    ) * class_transform.e
-    # 0 = south/Gilbert, 1 = north/Gunnison. The constant-latitude split also
-    # keeps Bear River and Farmington Bays with the south arm as requested.
-    raster_arms = np.broadcast_to(
-        (row_y[:, None] >= causeway_y[0]).astype(np.uint8), classes.shape
-    )
-    crop_window = _tight_healthy_crop(
+    (
+        occurrence,
         classes,
-        np.isfinite(occurrence) & (classes != 255),
-    )
+        lost_depth,
+        synthetic,
+        crop_window,
+        frame_metadata,
+    ) = _wide_frame(occurrence, classes, lost_depth)
     row0, row1, col0, col1 = crop_window
-    occurrence = occurrence[row0:row1, col0:col1]
-    classes = classes[row0:row1, col0:col1]
-    lost_depth = lost_depth[row0:row1, col0:col1]
-    raster_arms = raster_arms[row0:row1, col0:col1]
+    row_y = class_transform.f + (
+        row0 + np.arange(classes.shape[0]) + 0.5
+    ) * class_transform.e
+    column_x = class_transform.c + (
+        col0 + np.arange(classes.shape[1]) + 0.5
+    ) * class_transform.a
+    # 0 = south/Gilbert, 1 = north/Gunnison. The OSM causeway ends at
+    # Promontory Point, so eastern bays remain connected to the south arm.
+    raster_arms = classify_grid(column_x, row_y)
 
     interior = _sample_weighted_points(occurrence, classes, rng)
     relaxed = lloyd_relax(interior, LLOYD_ITERATIONS)
@@ -245,6 +270,7 @@ def build_mesh(seed: int = SEED) -> dict:
     triangle_depth = _sample_raster(lost_depth, centroids).astype(np.float32)
     triangle_occurrence = _sample_raster(occurrence, centroids).astype(np.float32)
     triangle_arms = _sample_raster(raster_arms, centroids).astype(np.uint8)
+    triangle_synthetic = _sample_raster(synthetic, centroids).astype(bool)
     mixed, mixed_fraction, contour_fraction = _mixed_fraction(
         points, simplices, classes
     )
@@ -257,10 +283,18 @@ def build_mesh(seed: int = SEED) -> dict:
         lost_depth=triangle_depth,
         occurrence=triangle_occurrence,
         arms=triangle_arms,
+        synthetic_texture=triangle_synthetic,
         mixed=mixed,
         raster_shape=np.array(classes.shape, dtype=np.int32),
         original_raster_shape=np.array(original_shape, dtype=np.int32),
         crop_window=np.array(crop_window, dtype=np.int32),
+        healthy_extent_frame_height_fraction=np.array(
+            frame_metadata["healthy_extent_frame_height_fraction"],
+            dtype=np.float64,
+        ),
+        source_valid_pixel_fraction=np.array(
+            frame_metadata["source_valid_pixel_fraction"], dtype=np.float64
+        ),
     )
     report = {
         "seed": seed,
@@ -269,16 +303,17 @@ def build_mesh(seed: int = SEED) -> dict:
         "lloyd_iterations": LLOYD_ITERATIONS,
         "shoreline_anchors": int(len(anchors)),
         "valid_data_crop": {
-            "method": "4,198 ft extent plus six-percent margin on each side",
-            "margin_fraction_each_side": HEALTHY_CROP_MARGIN,
+            "method": "north-up 16:9 frame with the 4,198 ft extent at about 92% height",
             "original_raster_shape": list(original_shape),
             "window_row0_row1_col0_col1": list(crop_window),
             "cropped_raster_shape": list(classes.shape),
-            "aspect_ratio_width_over_height": float(
-                classes.shape[1] / classes.shape[0]
-            ),
+            **frame_metadata,
             "contains_nodata": bool(np.any(classes == 255)),
             "frame_boundary_points": FRAME_SAMPLES_PER_EDGE * 4,
+            "out_of_data_treatment": (
+                "land spectral-family texture only; no water class and no metamers"
+            ),
+            "synthetic_texture_triangle_count": int(triangle_synthetic.sum()),
         },
         "mixed_class_triangles": int(mixed.sum()),
         "mixed_class_fraction_of_valid": mixed_fraction,
@@ -313,10 +348,20 @@ def build_mesh(seed: int = SEED) -> dict:
             },
         },
         "arm_split": {
-            "method": "railroad causeway reference latitude",
-            "latitude": CAUSEWAY_LAT,
+            "method": "OpenStreetMap Lucin Cutoff railway polyline",
             "north": "Gunnison Bay",
             "south": "Gilbert Bay, Bear River Bay, and Farmington Bay",
+            "source": source_metadata(),
+            "reference_checks": {
+                "bear_river_bay": {
+                    "longitude_latitude": list(BEAR_RIVER_BAY_WGS84),
+                    "arm": "south" if classify_wgs84(*BEAR_RIVER_BAY_WGS84) == 0 else "north",
+                },
+                "farmington_bay": {
+                    "longitude_latitude": list(FARMINGTON_BAY_WGS84),
+                    "arm": "south" if classify_wgs84(*FARMINGTON_BAY_WGS84) == 0 else "north",
+                },
+            },
         },
         "density": (
             "JRC occurrence-gradient magnitude with a boost at the visible current "

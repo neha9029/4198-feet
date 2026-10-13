@@ -252,7 +252,6 @@ def render_previews(long_side: int = 1600) -> dict:
     baseline_array = np.asarray(baseline, dtype=np.int16)
     d65_array = np.asarray(d65, dtype=np.int16)
     aspect_ratio = d65.width / d65.height
-    rotated_aspect_ratio = 1.0 / aspect_ratio
     target_aspect_ratio = 16.0 / 9.0
     report = {
         "long_side_px": long_side,
@@ -280,14 +279,18 @@ def render_previews(long_side: int = 1600) -> dict:
         "recommended_water_variant": RECOMMENDED_WATER_VARIANT,
         "water_variant_d65_lstar": water_variant_lstar,
         "framing": {
-            "tight_crop_aspect_ratio_width_over_height": aspect_ratio,
-            "rotated_aspect_ratio_width_over_height": rotated_aspect_ratio,
+            "north_up": True,
+            "frame_aspect_ratio_width_over_height": aspect_ratio,
             "film_aspect_ratio": target_aspect_ratio,
-            "recommended_fit": "rotate 90 degrees, then pad left and right to 16:9",
-            "rotated_width_fraction_of_16_9_frame": (
-                rotated_aspect_ratio / target_aspect_ratio
+            "healthy_extent_frame_height_fraction": float(
+                mesh["healthy_extent_frame_height_fraction"]
             ),
-            "film_settings_changed": False,
+            "source_valid_pixel_fraction": float(
+                mesh["source_valid_pixel_fraction"]
+            ),
+            "out_of_data_treatment": (
+                "land spectral-family texture only; no metamers"
+            ),
         },
     }
     RENDER_REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

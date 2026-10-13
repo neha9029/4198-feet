@@ -6,7 +6,7 @@ import hashlib
 import json
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import brentq, minimize
 from scipy.stats import ks_2samp
 
 from data import DATA_DIR, SEED
@@ -44,6 +44,9 @@ TARGET_COHERENCE = 0.90
 LAND_CELL_VARIATION_SIGMA = 0.16
 WATER_VARIANTS = {"A": None, "B": 45.0, "C": 55.0}
 RECOMMENDED_WATER_VARIANT = "B"
+WATER_CELL_VARIATION_SIGMA = 0.09
+NORTH_CHROMA_SCALE = 0.75
+NORTH_HUE_ROTATION_DEGREES = 10.0
 SPECTRA_BASE_PATH = DATA_DIR / "phase2_base_spectra.npy"
 SPECTRA_FINAL_PATH = DATA_DIR / "phase2_final_spectra.npy"
 REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "metamer_report.json"
@@ -105,6 +108,38 @@ def _scale_to_lstar(spectrum: np.ndarray, target_lstar: float) -> np.ndarray:
     return np.clip(spectrum * (target_y / current_y), LOW, HIGH)
 
 
+def _north_burgundy_spectrum(
+    spectrum: np.ndarray, target_lstar: float
+) -> np.ndarray:
+    """Reduce north-arm chroma 25% and rotate its D65 hue 10° toward red."""
+    base = _scale_to_lstar(spectrum, target_lstar)
+    base_lab = _lab_under_d65(base[None, :])[0]
+    target_hue = np.arctan2(base_lab[2], base_lab[1]) + np.deg2rad(
+        NORTH_HUE_ROTATION_DEGREES
+    )
+    white = spectra_to_xyz(np.ones((1, len(WAVELENGTHS))), D65_SPD)[0]
+    base_xyz = spectra_to_xyz(base[None, :], D65_SPD)[0]
+    neutral = np.full_like(base, base_xyz[1] / white[1])
+    desaturated = NORTH_CHROMA_SCALE * base + (1.0 - NORTH_CHROMA_SCALE) * neutral
+
+    red = _gaussian(650, 75)
+    violet = _gaussian(430, 50)
+    red_y = spectra_to_xyz(red[None, :], D65_SPD)[0, 1]
+    violet_y = spectra_to_xyz(violet[None, :], D65_SPD)[0, 1]
+    hue_axis = red - (red_y / violet_y) * violet
+
+    def shifted(amplitude: float) -> np.ndarray:
+        candidate = np.clip(desaturated + amplitude * hue_axis, LOW, HIGH)
+        return _scale_to_lstar(candidate, target_lstar)
+
+    def hue_error(amplitude: float) -> float:
+        lab = _lab_under_d65(shifted(amplitude)[None, :])[0]
+        return float(np.arctan2(lab[2], lab[1]) - target_hue)
+
+    amplitude = brentq(hue_error, -0.02, 0.05)
+    return shifted(amplitude)
+
+
 def build_water_spectra(
     centroids: np.ndarray,
     arms: np.ndarray,
@@ -117,7 +152,7 @@ def build_water_spectra(
     _, north_water, south_water = build_spectral_families(centroids, seed)
     target_lstar = WATER_VARIANTS[variant]
     if target_lstar is not None:
-        north_water = _scale_to_lstar(north_water, target_lstar)
+        north_water = _north_burgundy_spectrum(north_water, target_lstar)
         south_water = _scale_to_lstar(south_water, target_lstar)
 
     spectra = np.where(
@@ -128,8 +163,12 @@ def build_water_spectra(
     if target_lstar is not None:
         rng = np.random.default_rng(seed + 311 + ord(variant))
         smooth = smooth_field(centroids, rng, waves=3, scale=1.45)
-        jitter = np.clip(rng.normal(0.0, 0.018, len(centroids)), -0.045, 0.045)
-        spectra *= (1.0 + 0.012 * smooth + jitter)[:, None]
+        jitter = np.clip(
+            rng.normal(0.0, WATER_CELL_VARIATION_SIGMA, len(centroids)),
+            -2.0 * WATER_CELL_VARIATION_SIGMA,
+            2.0 * WATER_CELL_VARIATION_SIGMA,
+        )
+        spectra *= (1.0 + 0.010 * smooth + jitter)[:, None]
     return np.clip(spectra, LOW, HIGH)
 
 
@@ -526,6 +565,42 @@ def _adjacent_camouflage(mesh: np.lib.npyio.NpzFile, bases: np.ndarray) -> dict:
     }
 
 
+def _water_report(mesh: np.lib.npyio.NpzFile, bases: np.ndarray) -> dict:
+    """Report current-water facet contrast and arm colours under both lights."""
+    classes = mesh["classes"]
+    arms = mesh["arms"]
+    pairs = _triangle_adjacencies(mesh["simplices"])
+    same_arm_water = (
+        (classes[pairs[:, 0]] == 2)
+        & (classes[pairs[:, 1]] == 2)
+        & (arms[pairs[:, 0]] == arms[pairs[:, 1]])
+    )
+    water_pairs = pairs[same_arm_water]
+    lab_d65 = _lab_under_d65(bases)
+    facet_delta = np.linalg.norm(
+        lab_d65[water_pairs[:, 0]] - lab_d65[water_pairs[:, 1]], axis=1
+    )
+    lab_a = _lab_under_a(bases)
+    arm_lab = {}
+    for arm, value in (("north", 1), ("south", 0)):
+        mask = (classes == 2) & (arms == value)
+        arm_lab[arm] = {
+            "triangle_count": int(mask.sum()),
+            "median_lab_d65": [float(item) for item in np.median(lab_d65[mask], axis=0)],
+            "median_lab_a": [float(item) for item in np.median(lab_a[mask], axis=0)],
+        }
+    return {
+        "adjacent_same_arm_pair_count": int(len(facet_delta)),
+        "adjacent_median_delta_e76_d65": float(np.median(facet_delta)),
+        "adjacent_p90_delta_e76_d65": float(np.percentile(facet_delta, 90)),
+        "target_adjacent_median_delta_e76_d65": 2.0,
+        "arm_lab": arm_lab,
+        "north_chroma_scale": NORTH_CHROMA_SCALE,
+        "north_hue_rotation_toward_red_degrees": NORTH_HUE_ROTATION_DEGREES,
+        "fixed_non_metameric": True,
+    }
+
+
 def solve_metamers(seed: int = SEED) -> dict:
     """Sweep per-arm reveal directions, solve all lost cells, and verify identity."""
     mesh = np.load(MESH_PATH)
@@ -617,6 +692,7 @@ def solve_metamers(seed: int = SEED) -> dict:
         np.abs(spectra_to_xyz(final, D65_SPD) - spectra_to_xyz(bases, D65_SPD))
     )
     camouflage = _adjacent_camouflage(mesh, bases)
+    water = _water_report(mesh, bases)
     base_reflectance = {
         label: {
             "sample_median": float(np.median(bases[classes == class_value])),
@@ -642,6 +718,7 @@ def solve_metamers(seed: int = SEED) -> dict:
         "land_cell_variation_sigma": LAND_CELL_VARIATION_SIGMA,
         "base_reflectance_by_class": base_reflectance,
         "d65_camouflage": camouflage,
+        "current_water": water,
         "d65_constraint": "exact linear XYZ equality in a projected spectral nullspace",
         "objective": {
             "form": (

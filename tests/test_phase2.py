@@ -74,8 +74,10 @@ def test_render_crop_has_no_nodata_triangles() -> None:
     mesh = report()["mesh"]
     assert mesh["valid_data_crop"]["contains_nodata"] is False
     assert mesh["class_triangle_counts"]["nodata"] == 0
-    assert mesh["valid_data_crop"]["margin_fraction_each_side"] == 0.06
-    assert 0.75 < mesh["valid_data_crop"]["aspect_ratio_width_over_height"] < 0.80
+    frame = mesh["valid_data_crop"]
+    assert abs(frame["aspect_ratio_width_over_height"] - 16.0 / 9.0) < 0.001
+    assert abs(frame["healthy_extent_frame_height_fraction"] - 0.92) < 0.001
+    assert frame["synthetic_texture_triangle_count"] > 0
 
 
 def test_causeway_arm_split_and_current_water_colours() -> None:
@@ -85,6 +87,17 @@ def test_causeway_arm_split_and_current_water_colours() -> None:
     south = mesh_report["lost_water_by_arm"]["south"]
     assert north["area_km2"] > 0.0 and south["area_km2"] > 0.0
     assert north["triangle_count"] + south["triangle_count"] == mesh_report["class_triangle_counts"]["lost_water"]
+    assert mesh_report["arm_split"]["source"]["source"] == "OpenStreetMap railway geometry"
+    assert mesh_report["arm_split"]["reference_checks"]["bear_river_bay"]["arm"] == "south"
+
+    from causeway import BEAR_RIVER_BAY_WGS84, classify_wgs84
+
+    bear_lon, bear_lat = BEAR_RIVER_BAY_WGS84
+    assert {
+        classify_wgs84(bear_lon + dx, bear_lat + dy)
+        for dx in (-0.01, 0.0, 0.01)
+        for dy in (-0.01, 0.0, 0.01)
+    } == {0}
 
     mesh = np.load(ROOT / "data" / "gsl_mesh_phase2.npz")
     spectra = np.load(ROOT / "data" / "phase2_base_spectra.npy")
@@ -112,5 +125,16 @@ def test_water_variants_and_framing_report() -> None:
         assert abs(result["water_variant_d65_lstar"]["B"][arm] - 45.0) < 1.0
         assert abs(result["water_variant_d65_lstar"]["C"][arm] - 55.0) < 1.0
     framing = result["framing"]
-    assert framing["film_settings_changed"] is False
-    assert framing["recommended_fit"] == "rotate 90 degrees, then pad left and right to 16:9"
+    assert framing["north_up"] is True
+    assert abs(framing["film_aspect_ratio"] - 16.0 / 9.0) < 1e-12
+    assert abs(framing["healthy_extent_frame_height_fraction"] - 0.92) < 0.001
+    assert framing["out_of_data_treatment"].endswith("no metamers")
+
+
+def test_water_facets_and_north_arm_colour() -> None:
+    water = report()["metamers"]["current_water"]
+    assert 1.5 <= water["adjacent_median_delta_e76_d65"] <= 2.5
+    assert water["fixed_non_metameric"] is True
+    north = water["arm_lab"]["north"]["median_lab_d65"]
+    assert abs(north[0] - 45.0) < 1.0
+    assert north[1] > 0.0 and north[2] < 0.0
