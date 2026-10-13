@@ -72,12 +72,22 @@ def test_daylight_camouflage_and_per_arm_reveal_trials() -> None:
 
 def test_render_crop_has_no_nodata_triangles() -> None:
     mesh = report()["mesh"]
+    assert mesh["target_points"] == 25_000
+    assert mesh["points"] == 25_000
+    assert mesh["triangles"] > 49_000
     assert mesh["valid_data_crop"]["contains_nodata"] is False
     assert mesh["class_triangle_counts"]["nodata"] == 0
     frame = mesh["valid_data_crop"]
     assert abs(frame["aspect_ratio_width_over_height"] - 16.0 / 9.0) < 0.001
     assert abs(frame["healthy_extent_frame_height_fraction"] - 0.92) < 0.001
     assert frame["synthetic_texture_triangle_count"] > 0
+
+
+def test_mesh_density_camouflage() -> None:
+    density = report()["mesh"]["density_camouflage"]
+    assert density["distance_m"] == 5_000.0
+    assert density["relative_difference"] <= 0.10
+    assert density["passes_target"] is True
 
 
 def test_causeway_arm_split_and_current_water_colours() -> None:

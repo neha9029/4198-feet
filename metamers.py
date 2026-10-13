@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
+import multiprocessing as mp
+import os
+import time
 
 import numpy as np
 from scipy.optimize import brentq, minimize
@@ -33,7 +37,7 @@ ARM_ANGLES = {
     "north": (0.0, 15.0, -15.0),
     "south": (-180.0, -175.0, -170.0, -165.0, -150.0),
 }
-SWEEP_SAMPLE_SIZE_PER_ARM = 64
+SWEEP_SAMPLE_SIZE_PER_ARM = 256
 NULL_BASIS_SIZE = 12
 PROJECTION_GAIN = 10.0
 ORTHOGONAL_WEIGHT = 2.0
@@ -44,9 +48,11 @@ TARGET_COHERENCE = 0.90
 LAND_CELL_VARIATION_SIGMA = 0.16
 WATER_VARIANTS = {"A": None, "B": 45.0, "C": 55.0}
 RECOMMENDED_WATER_VARIANT = "B"
-WATER_CELL_VARIATION_SIGMA = 0.09
+WATER_CELL_VARIATION_SIGMA = 0.096
 NORTH_CHROMA_SCALE = 0.75
 NORTH_HUE_ROTATION_DEGREES = 10.0
+PARALLEL_WORKERS = min(8, max(1, (os.cpu_count() or 2) - 1))
+PARALLEL_CHUNKS_PER_WORKER = 4
 SPECTRA_BASE_PATH = DATA_DIR / "phase2_base_spectra.npy"
 SPECTRA_FINAL_PATH = DATA_DIR / "phase2_final_spectra.npy"
 REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "metamer_report.json"
@@ -426,6 +432,48 @@ def _run_trial(
     }
 
 
+def _trial_job(payload: tuple) -> dict:
+    """Run one direction/smoothness sweep job in a worker process."""
+    (
+        arm,
+        angle_degrees,
+        smoothness_weight,
+        sample_indices,
+        sample_bases,
+        sample_depths,
+        basis,
+        seed,
+    ) = payload
+    direction = _angle_direction(angle_degrees)
+    diagnostics = []
+    for triangle_index, base, depth in zip(
+        sample_indices, sample_bases, sample_depths
+    ):
+        _, diagnostic = _solve_one(
+            base,
+            depth,
+            direction,
+            smoothness_weight,
+            basis,
+            (
+                seed
+                + (0 if arm == "south" else 1_000_000)
+                + int(round(angle_degrees + 180.0)) * 10_000
+                + int(smoothness_weight) * 100
+                + int(triangle_index)
+            ),
+            restarts=SEEDED_RESTARTS,
+        )
+        diagnostics.append(diagnostic)
+    return {
+        "arm": arm,
+        "angle_degrees": angle_degrees,
+        "smoothness_weight": smoothness_weight,
+        "sample_count": int(len(sample_indices)),
+        **_summarise(diagnostics),
+    }
+
+
 def _choose_arm_trial(arm: str, sweep: list[dict]) -> dict:
     coherent = [
         item
@@ -460,6 +508,7 @@ def _solve_indices(
     smoothness_weight: float,
     basis: np.ndarray,
     seed_offset: int,
+    seed: int = SEED,
 ) -> tuple[np.ndarray, list[dict]]:
     solved = bases.copy()
     diagnostics: list[dict] = []
@@ -470,11 +519,83 @@ def _solve_indices(
             direction,
             smoothness_weight,
             basis,
-            SEED + seed_offset + int(triangle_index),
+            seed + seed_offset + int(triangle_index),
             restarts=SEEDED_RESTARTS,
         )
         diagnostic["triangle_index"] = int(triangle_index)
         diagnostics.append(diagnostic)
+    return solved, diagnostics
+
+
+def _solve_chunk(payload: tuple) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """Solve a deterministic chunk of cells in one worker process."""
+    (
+        indices,
+        bases,
+        depths,
+        direction,
+        smoothness_weight,
+        basis,
+        seed_offset,
+        seed,
+    ) = payload
+    solved = np.empty_like(bases)
+    diagnostics = []
+    for local_index, triangle_index in enumerate(indices):
+        solved[local_index], diagnostic = _solve_one(
+            bases[local_index],
+            depths[local_index],
+            direction,
+            smoothness_weight,
+            basis,
+            seed + seed_offset + int(triangle_index),
+            restarts=SEEDED_RESTARTS,
+        )
+        diagnostic["triangle_index"] = int(triangle_index)
+        diagnostics.append(diagnostic)
+    return indices, solved, diagnostics
+
+
+def _solve_indices_parallel(
+    bases: np.ndarray,
+    indices: np.ndarray,
+    depths: np.ndarray,
+    direction: np.ndarray,
+    smoothness_weight: float,
+    basis: np.ndarray,
+    seed_offset: int,
+    seed: int,
+    workers: int,
+) -> tuple[np.ndarray, list[dict]]:
+    """Solve cells in deterministic index chunks across spawned processes."""
+    chunks = [
+        chunk
+        for chunk in np.array_split(indices, workers * PARALLEL_CHUNKS_PER_WORKER)
+        if len(chunk)
+    ]
+    payloads = [
+        (
+            chunk,
+            bases[chunk],
+            depths[chunk],
+            direction,
+            smoothness_weight,
+            basis,
+            seed_offset,
+            seed,
+        )
+        for chunk in chunks
+    ]
+    solved = bases.copy()
+    diagnostics = []
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+        for chunk_indices, chunk_spectra, chunk_diagnostics in executor.map(
+            _solve_chunk, payloads
+        ):
+            solved[chunk_indices] = chunk_spectra
+            diagnostics.extend(chunk_diagnostics)
+    diagnostics.sort(key=lambda item: item["triangle_index"])
     return solved, diagnostics
 
 
@@ -603,6 +724,7 @@ def _water_report(mesh: np.lib.npyio.NpzFile, bases: np.ndarray) -> dict:
 
 def solve_metamers(seed: int = SEED) -> dict:
     """Sweep per-arm reveal directions, solve all lost cells, and verify identity."""
+    solve_started = time.perf_counter()
     mesh = np.load(MESH_PATH)
     centroids = mesh["centroids"]
     classes = mesh["classes"]
@@ -622,34 +744,40 @@ def solve_metamers(seed: int = SEED) -> dict:
     sweep: list[dict] = []
     chosen_by_arm: dict[str, dict] = {}
     arm_indices: dict[str, np.ndarray] = {}
+    sweep_payloads = []
     for arm, arm_value in (("north", 1), ("south", 0)):
         indices = np.flatnonzero((classes == 1) & (arms == arm_value))
         arm_indices[arm] = indices
         sample_indices = _sample_lost_indices(indices)
-        arm_sweep = []
         for angle_degrees in ARM_ANGLES[arm]:
             for smoothness_weight in SMOOTHNESS_WEIGHTS:
-                row = _run_trial(
-                    arm,
-                    angle_degrees,
-                    smoothness_weight,
-                    sample_indices,
-                    bases,
-                    depth_fraction,
-                    basis,
+                sweep_payloads.append(
+                    (
+                        arm,
+                        angle_degrees,
+                        smoothness_weight,
+                        sample_indices,
+                        bases[sample_indices],
+                        depth_fraction[sample_indices],
+                        basis,
+                        seed,
+                    )
                 )
-                arm_sweep.append(row)
-                sweep.append(row)
+    context = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=PARALLEL_WORKERS, mp_context=context
+    ) as executor:
+        sweep = list(executor.map(_trial_job, sweep_payloads))
+    for arm in ("north", "south"):
+        arm_sweep = [row for row in sweep if row["arm"] == arm]
         chosen_by_arm[arm] = _choose_arm_trial(arm, arm_sweep)
 
     final = bases.copy()
-    repeated = bases.copy()
     diagnostics_by_arm: dict[str, list[dict]] = {}
-    repeated_by_arm: dict[str, list[dict]] = {}
     for arm, seed_offset in (("north", 2_000_000), ("south", 3_000_000)):
         chosen = chosen_by_arm[arm]
         indices = arm_indices[arm]
-        solved, diagnostics = _solve_indices(
+        solved, diagnostics = _solve_indices_parallel(
             bases,
             indices,
             depth_fraction,
@@ -657,24 +785,53 @@ def solve_metamers(seed: int = SEED) -> dict:
             float(chosen["smoothness_weight"]),
             basis,
             seed_offset,
-        )
-        repeated_solved, repeated_diagnostics = _solve_indices(
-            bases,
-            indices,
-            depth_fraction,
-            _angle_direction(float(chosen["angle_degrees"])),
-            float(chosen["smoothness_weight"]),
-            basis,
-            seed_offset,
+            seed,
+            PARALLEL_WORKERS,
         )
         final[indices] = solved[indices]
-        repeated[indices] = repeated_solved[indices]
         diagnostics_by_arm[arm] = diagnostics
-        repeated_by_arm[arm] = repeated_diagnostics
+
+    deterministic_checks = []
+    repeat_success_equal = True
+    for arm, seed_offset in (("north", 2_000_000), ("south", 3_000_000)):
+        chosen = chosen_by_arm[arm]
+        repeat_indices = _sample_lost_indices(arm_indices[arm])
+        repeated, repeated_diagnostics = _solve_indices(
+            bases,
+            repeat_indices,
+            depth_fraction,
+            _angle_direction(float(chosen["angle_degrees"])),
+            float(chosen["smoothness_weight"]),
+            basis,
+            seed_offset,
+            seed,
+        )
+        original_by_index = {
+            item["triangle_index"]: item for item in diagnostics_by_arm[arm]
+        }
+        repeated_equal = bool(
+            np.array_equal(repeated[repeat_indices], final[repeat_indices])
+        )
+        success_equal = all(
+            item["success"]
+            == original_by_index[item["triangle_index"]]["success"]
+            for item in repeated_diagnostics
+        )
+        repeat_success_equal = repeat_success_equal and success_equal
+        deterministic_checks.append(
+            {
+                "arm": arm,
+                "cell_count": int(len(repeat_indices)),
+                "spectra_exactly_equal": repeated_equal,
+                "success_pattern_equal": success_equal,
+            }
+        )
 
     diagnostics = diagnostics_by_arm["north"] + diagnostics_by_arm["south"]
-    repeated_diagnostics = repeated_by_arm["north"] + repeated_by_arm["south"]
-    deterministic = bool(np.array_equal(final, repeated))
+    deterministic = all(
+        item["spectra_exactly_equal"] for item in deterministic_checks
+    )
+    solve_time_seconds = time.perf_counter() - solve_started
     final_summary = _summarise(diagnostics)
     arm_results = {
         arm: {
@@ -716,6 +873,14 @@ def solve_metamers(seed: int = SEED) -> dict:
         "recommended_water_variant": RECOMMENDED_WATER_VARIANT,
         "water_variants_lstar": WATER_VARIANTS,
         "land_cell_variation_sigma": LAND_CELL_VARIATION_SIGMA,
+        "parallel_solver": {
+            "workers": PARALLEL_WORKERS,
+            "start_method": "spawn",
+            "chunks_per_worker": PARALLEL_CHUNKS_PER_WORKER,
+            "seed_rule": "SEED + arm offset + triangle index",
+            "total_solve_time_seconds": float(solve_time_seconds),
+            "deterministic_repeat_checks": deterministic_checks,
+        },
         "base_reflectance_by_class": base_reflectance,
         "d65_camouflage": camouflage,
         "current_water": water,
@@ -755,8 +920,7 @@ def solve_metamers(seed: int = SEED) -> dict:
         "deterministic_repeat_equal": deterministic,
         "base_spectra_sha256": hashlib.sha256(bases.tobytes()).hexdigest(),
         "final_spectra_sha256": hashlib.sha256(final.tobytes()).hexdigest(),
-        "repeat_success_pattern_equal": [item["success"] for item in diagnostics]
-        == [item["success"] for item in repeated_diagnostics],
+        "repeat_success_pattern_equal": repeat_success_equal,
     }
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

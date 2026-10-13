@@ -21,11 +21,14 @@ from data import DATA_DIR, SEED
 from engine import lloyd_relax
 
 
-INTERIOR_POINTS = 2_900
-SHORELINE_ANCHORS = 800
+TARGET_POINTS = 25_000
+COMPARISON_POINT_COUNTS = (15_000, 25_000, 30_000)
+SHORELINE_ANCHORS = 0
 FRAME_SAMPLES_PER_EDGE = 34
 LLOYD_ITERATIONS = 2
 DENSITY_STRIDE = 8
+DENSITY_TEST_STRIDE = 4
+DENSITY_TEST_DISTANCE_M = 5_000.0
 LAKE_FRAME_HEIGHT_FRACTION = 0.92
 FRAME_ASPECT_RATIO = 16.0 / 9.0
 MESH_PATH = DATA_DIR / "gsl_mesh_phase2.npz"
@@ -128,34 +131,23 @@ def _sample_weighted_points(
     occurrence: np.ndarray,
     classes: np.ndarray,
     rng: np.random.Generator,
+    count: int,
 ) -> np.ndarray:
-    """Sample points from occurrence gradient with strong shoreline boosts."""
-    small_occurrence = occurrence[::DENSITY_STRIDE, ::DENSITY_STRIDE]
+    """Sample a uniform texture so geometry cannot disclose lake classes."""
+    del occurrence
     small_classes = classes[::DENSITY_STRIDE, ::DENSITY_STRIDE]
-    valid = np.isfinite(small_occurrence) & (small_classes != 255)
-    filled = np.nan_to_num(small_occurrence, nan=0.0)
-    gy, gx = np.gradient(filled)
-    gradient = np.hypot(gx, gy)
-    if np.any(valid):
-        scale = np.percentile(gradient[valid], 98)
-        gradient = np.clip(gradient / max(scale, 1e-6), 0.0, 1.0)
-    current_edge = _edge(small_classes == 2)
-    shoreline = ndimage.gaussian_filter(
-        current_edge.astype(np.float32), sigma=2.0
-    )
-    if shoreline.max() > 0:
-        shoreline /= shoreline.max()
-    density = valid * (0.04 + 1.35 * gradient + 5.5 * shoreline)
+    valid = small_classes != 255
+    density = valid.astype(np.float64)
     probability = density.ravel()
     probability /= probability.sum()
     indices = rng.choice(
         probability.size,
-        size=INTERIOR_POINTS,
+        size=count,
         replace=False,
         p=probability,
     )
     rows, columns = np.unravel_index(indices, density.shape)
-    jitter = rng.uniform(-0.42, 0.42, size=(INTERIOR_POINTS, 2))
+    jitter = rng.uniform(-0.42, 0.42, size=(count, 2))
     x = (columns + 0.5 + jitter[:, 0]) / density.shape[1]
     y = (rows + 0.5 + jitter[:, 1]) / density.shape[0]
     return np.clip(np.column_stack([x, y]), 0.0, 1.0)
@@ -190,6 +182,15 @@ def _frame_points() -> np.ndarray:
             np.column_stack([np.ones_like(edge), edge]),
         ]
     )
+
+
+def _interior_point_count(target_points: int) -> int:
+    """Reserve room for the fixed shoreline and unique frame anchors."""
+    unique_frame_points = FRAME_SAMPLES_PER_EDGE * 4 - 4
+    count = target_points - SHORELINE_ANCHORS - unique_frame_points
+    if count <= 0:
+        raise ValueError("target_points is too small for fixed mesh anchors")
+    return count
 
 
 def _sample_raster(values: np.ndarray, points: np.ndarray) -> np.ndarray:
@@ -227,8 +228,61 @@ def _mixed_fraction(
     )
 
 
-def build_mesh(seed: int = SEED) -> dict:
-    """Build and cache the approximately 3,000-point Phase 2 mesh."""
+def _density_camouflage(
+    classes: np.ndarray,
+    centroids: np.ndarray,
+    triangle_classes: np.ndarray,
+    pixel_size_m: float,
+) -> dict:
+    """Compare local triangle density across the hidden healthy shoreline."""
+    small_classes = classes[::DENSITY_TEST_STRIDE, ::DENSITY_TEST_STRIDE]
+    healthy = np.isin(small_classes, (1, 2))
+    healthy_edge = healthy ^ ndimage.binary_erosion(healthy)
+    outside_edge = ndimage.binary_dilation(healthy) ^ healthy
+    shoreline = healthy_edge | outside_edge
+    distance_m = ndimage.distance_transform_edt(~shoreline) * (
+        pixel_size_m * DENSITY_TEST_STRIDE
+    )
+    near = distance_m <= DENSITY_TEST_DISTANCE_M
+    triangle_near = _sample_raster(near, centroids).astype(bool)
+    pixel_area_km2 = (
+        pixel_size_m * DENSITY_TEST_STRIDE
+    ) ** 2 / 1_000_000.0
+    rows = {}
+    for label, class_value in (("lost_water", 1), ("land", 0)):
+        area_km2 = float(
+            np.count_nonzero(near & (small_classes == class_value))
+            * pixel_area_km2
+        )
+        triangle_count = int(
+            np.count_nonzero(triangle_near & (triangle_classes == class_value))
+        )
+        rows[label] = {
+            "area_km2": area_km2,
+            "triangle_count": triangle_count,
+            "triangles_per_km2": triangle_count / area_km2,
+        }
+    ratio = rows["lost_water"]["triangles_per_km2"] / rows["land"][
+        "triangles_per_km2"
+    ]
+    return {
+        "method": "triangle count per raster area within 5 km of the 4,198 ft shoreline",
+        "distance_m": DENSITY_TEST_DISTANCE_M,
+        "raster_stride": DENSITY_TEST_STRIDE,
+        **rows,
+        "lost_to_land_density_ratio": float(ratio),
+        "relative_difference": float(abs(ratio - 1.0)),
+        "tolerance": 0.10,
+        "passes_target": bool(abs(ratio - 1.0) <= 0.10),
+    }
+def build_mesh(
+    seed: int = SEED,
+    target_points: int = TARGET_POINTS,
+    *,
+    mesh_path: Path = MESH_PATH,
+    report_path: Path = MESH_REPORT_PATH,
+) -> dict:
+    """Build and cache one deterministic high-density Phase 2 mesh."""
     rng = np.random.default_rng(seed)
     with rasterio.open(DATA_DIR / "gsw_occurrence_gsl_utm12.tif") as dataset:
         occurrence = dataset.read(1)
@@ -258,7 +312,8 @@ def build_mesh(seed: int = SEED) -> dict:
     # Promontory Point, so eastern bays remain connected to the south arm.
     raster_arms = classify_grid(column_x, row_y)
 
-    interior = _sample_weighted_points(occurrence, classes, rng)
+    interior_count = _interior_point_count(target_points)
+    interior = _sample_weighted_points(occurrence, classes, rng, interior_count)
     relaxed = lloyd_relax(interior, LLOYD_ITERATIONS)
     anchors = _shoreline_points(classes, rng)
     points = np.vstack([relaxed, anchors, _frame_points()])
@@ -274,8 +329,14 @@ def build_mesh(seed: int = SEED) -> dict:
     mixed, mixed_fraction, contour_fraction = _mixed_fraction(
         points, simplices, classes
     )
+    density_camouflage = _density_camouflage(
+        classes,
+        centroids,
+        triangle_classes,
+        abs(float(class_transform.a)),
+    )
     np.savez_compressed(
-        MESH_PATH,
+        mesh_path,
         points=points.astype(np.float64),
         simplices=simplices,
         centroids=centroids.astype(np.float64),
@@ -298,6 +359,8 @@ def build_mesh(seed: int = SEED) -> dict:
     )
     report = {
         "seed": seed,
+        "target_points": target_points,
+        "interior_points": interior_count,
         "points": int(len(points)),
         "triangles": int(len(simplices)),
         "lloyd_iterations": LLOYD_ITERATIONS,
@@ -309,7 +372,7 @@ def build_mesh(seed: int = SEED) -> dict:
             "cropped_raster_shape": list(classes.shape),
             **frame_metadata,
             "contains_nodata": bool(np.any(classes == 255)),
-            "frame_boundary_points": FRAME_SAMPLES_PER_EDGE * 4,
+            "frame_boundary_points": len(np.unique(_frame_points(), axis=0)),
             "out_of_data_treatment": (
                 "land spectral-family texture only; no water class and no metamers"
             ),
@@ -318,6 +381,7 @@ def build_mesh(seed: int = SEED) -> dict:
         "mixed_class_triangles": int(mixed.sum()),
         "mixed_class_fraction_of_valid": mixed_fraction,
         "class_boundary_mixed_fraction_of_valid": contour_fraction,
+        "density_camouflage": density_camouflage,
         "class_triangle_counts": {
             "land": int(np.count_nonzero(triangle_classes == 0)),
             "lost_water": int(np.count_nonzero(triangle_classes == 1)),
@@ -364,12 +428,12 @@ def build_mesh(seed: int = SEED) -> dict:
             },
         },
         "density": (
-            "JRC occurrence-gradient magnitude with a boost at the visible current "
-            "shoreline only; the hidden 4,198 ft boundary has no geometry cue"
+            "uniform sampling followed by Lloyd relaxation; neither water class nor "
+            "the hidden 4,198 ft boundary influences site density"
         ),
     }
-    MESH_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    MESH_REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 

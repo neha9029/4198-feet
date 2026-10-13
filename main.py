@@ -12,6 +12,7 @@ from phase1_decision import run_managed_decision
 from phase1_aoi import run_managed_aoi
 from phase2 import run_phase2
 from phase3 import run_phase3
+from mesh_density import build_density_comparison
 
 
 def main() -> None:
@@ -26,6 +27,7 @@ def main() -> None:
             "phase1-decision",
             "phase1-aoi",
             "phase2",
+            "phase2-density",
             "phase3",
         ),
     )
@@ -42,6 +44,8 @@ def main() -> None:
         print(json.dumps(run_managed_aoi(), indent=2))
     elif args.phase == "phase2":
         print(json.dumps(run_phase2(), indent=2))
+    elif args.phase == "phase2-density":
+        print(json.dumps(build_density_comparison(), indent=2))
     elif args.phase == "phase3":
         print(json.dumps(run_phase3(), indent=2))
 
