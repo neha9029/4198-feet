@@ -11,6 +11,7 @@ from phase1_managed import run_phase1_managed
 from phase1_decision import run_managed_decision
 from phase1_aoi import run_managed_aoi
 from phase2 import run_phase2
+from phase3 import run_phase3
 
 
 def main() -> None:
@@ -25,6 +26,7 @@ def main() -> None:
             "phase1-decision",
             "phase1-aoi",
             "phase2",
+            "phase3",
         ),
     )
     args = parser.parse_args()
@@ -40,6 +42,8 @@ def main() -> None:
         print(json.dumps(run_managed_aoi(), indent=2))
     elif args.phase == "phase2":
         print(json.dumps(run_phase2(), indent=2))
+    elif args.phase == "phase3":
+        print(json.dumps(run_phase3(), indent=2))
 
 
 if __name__ == "__main__":
