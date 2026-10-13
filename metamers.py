@@ -6,10 +6,8 @@ import hashlib
 import json
 
 import numpy as np
-import rasterio
-from scipy import ndimage
 from scipy.optimize import minimize
-from scipy.spatial import cKDTree
+from scipy.stats import ks_2samp
 
 from data import DATA_DIR, SEED
 from engine import (
@@ -33,7 +31,7 @@ ILLUMINANT_A_K = 2856
 SMOOTHNESS_WEIGHTS = (20.0, 50.0, 200.0)
 ARM_ANGLES = {
     "north": (0.0, 15.0, -15.0),
-    "south": (-180.0, -165.0, -150.0),
+    "south": (-180.0, -175.0, -170.0, -165.0, -150.0),
 }
 SWEEP_SAMPLE_SIZE_PER_ARM = 64
 NULL_BASIS_SIZE = 12
@@ -43,6 +41,9 @@ SEEDED_RESTARTS = 5
 DEPTH_STRENGTH_MIN = 0.60
 TARGET_MEDIAN_DELTA_E = 15.0
 TARGET_COHERENCE = 0.90
+LAND_CELL_VARIATION_SIGMA = 0.16
+WATER_VARIANTS = {"A": None, "B": 45.0, "C": 55.0}
+RECOMMENDED_WATER_VARIANT = "B"
 SPECTRA_BASE_PATH = DATA_DIR / "phase2_base_spectra.npy"
 SPECTRA_FINAL_PATH = DATA_DIR / "phase2_final_spectra.npy"
 REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "metamer_report.json"
@@ -69,6 +70,13 @@ def build_spectral_families(
     )
     land = land * (0.86 + 0.22 * ((field_a + 1.0) / 2.0))[:, None]
     land += (0.020 * field_b + 0.010 * field_c)[:, None]
+    cell_rng = np.random.default_rng(seed + 77)
+    cell_variation = np.clip(
+        cell_rng.normal(0.0, LAND_CELL_VARIATION_SIGMA, len(centroids)),
+        -2.0 * LAND_CELL_VARIATION_SIGMA,
+        2.0 * LAND_CELL_VARIATION_SIGMA,
+    )
+    land *= 1.0 + cell_variation[:, None]
 
     north_water = (
         0.018
@@ -89,6 +97,42 @@ def build_spectral_families(
     )
 
 
+def _scale_to_lstar(spectrum: np.ndarray, target_lstar: float) -> np.ndarray:
+    """Scale a spectral hue to a target D65 L* without changing chromaticity."""
+    white = spectra_to_xyz(np.ones((1, len(WAVELENGTHS))), D65_SPD)[0]
+    current_y = spectra_to_xyz(spectrum[None, :], D65_SPD)[0, 1]
+    target_y = white[1] * ((target_lstar + 16.0) / 116.0) ** 3
+    return np.clip(spectrum * (target_y / current_y), LOW, HIGH)
+
+
+def build_water_spectra(
+    centroids: np.ndarray,
+    arms: np.ndarray,
+    variant: str,
+    seed: int = SEED,
+) -> np.ndarray:
+    """Build fixed-hue, non-metameric current-water spectra for one variant."""
+    if variant not in WATER_VARIANTS:
+        raise ValueError(f"Unknown water variant: {variant}")
+    _, north_water, south_water = build_spectral_families(centroids, seed)
+    target_lstar = WATER_VARIANTS[variant]
+    if target_lstar is not None:
+        north_water = _scale_to_lstar(north_water, target_lstar)
+        south_water = _scale_to_lstar(south_water, target_lstar)
+
+    spectra = np.where(
+        (arms == 1)[:, None],
+        north_water[None, :],
+        south_water[None, :],
+    )
+    if target_lstar is not None:
+        rng = np.random.default_rng(seed + 311 + ord(variant))
+        smooth = smooth_field(centroids, rng, waves=3, scale=1.45)
+        jitter = np.clip(rng.normal(0.0, 0.018, len(centroids)), -0.045, 0.045)
+        spectra *= (1.0 + 0.012 * smooth + jitter)[:, None]
+    return np.clip(spectra, LOW, HIGH)
+
+
 def build_base_spectra(
     centroids: np.ndarray,
     classes: np.ndarray,
@@ -96,17 +140,18 @@ def build_base_spectra(
     occurrence: np.ndarray,
     seed: int = SEED,
     *,
+    water_variant: str = RECOMMENDED_WATER_VARIANT,
     return_water_reference: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Assign lost water, land, and managed cells to one continuous land family."""
     del occurrence  # Class-independent land continuity is deliberate.
-    land, north_water, south_water = build_spectral_families(centroids, seed)
+    land, _, _ = build_spectral_families(centroids, seed)
+    water = build_water_spectra(centroids, arms, water_variant, seed)
     spectra = land.copy()
-    spectra[(classes == 2) & (arms == 1)] = north_water
-    spectra[(classes == 2) & (arms == 0)] = south_water
+    spectra[classes == 2] = water[classes == 2]
     spectra[classes == 255] = 0.18
     if return_water_reference:
-        return spectra, {"north": north_water, "south": south_water}
+        return spectra, {"north": water[arms == 1], "south": water[arms == 0]}
     return spectra
 
 
@@ -416,54 +461,68 @@ def _depth_terciles(diagnostics: list[dict], depths: np.ndarray) -> list[dict]:
     return rows
 
 
-def _shoreline_camouflage(
-    mesh: np.lib.npyio.NpzFile, bases: np.ndarray
-) -> dict:
-    """Compare lost-to-land D65 differences with local land variation."""
+def _triangle_adjacencies(simplices: np.ndarray) -> np.ndarray:
+    """Return triangle pairs that share a complete Delaunay edge."""
+    owner: dict[tuple[int, int], int] = {}
+    pairs: list[tuple[int, int]] = []
+    for triangle_index, triangle in enumerate(simplices):
+        for first, second in (
+            (triangle[0], triangle[1]),
+            (triangle[1], triangle[2]),
+            (triangle[2], triangle[0]),
+        ):
+            edge = tuple(sorted((int(first), int(second))))
+            if edge in owner:
+                pairs.append((owner[edge], triangle_index))
+            else:
+                owner[edge] = triangle_index
+    return np.asarray(pairs, dtype=np.int32)
+
+
+def _adjacent_camouflage(mesh: np.lib.npyio.NpzFile, bases: np.ndarray) -> dict:
+    """Test whether a daylight shoreline is detectable from adjacent facets."""
     classes = mesh["classes"]
-    centroids = mesh["centroids"]
-    raster_h, raster_w = (int(value) for value in mesh["raster_shape"])
-    row0, row1, col0, col1 = (int(value) for value in mesh["crop_window"])
-    with rasterio.open(DATA_DIR / "gsl_classes_utm12.tif") as dataset:
-        raster_classes = dataset.read(1)[row0:row1, col0:col1]
-        resolution = abs(float(dataset.transform.a))
-    healthy = np.isin(raster_classes, (1, 2))
-    shoreline = healthy ^ ndimage.binary_erosion(healthy)
-    distance_m = ndimage.distance_transform_edt(~shoreline) * resolution
-    rows = np.clip(
-        np.rint(centroids[:, 1] * (raster_h - 1)), 0, raster_h - 1
-    ).astype(int)
-    columns = np.clip(
-        np.rint(centroids[:, 0] * (raster_w - 1)), 0, raster_w - 1
-    ).astype(int)
-    near = distance_m[rows, columns] <= 5_000.0
-    lost_indices = np.flatnonzero((classes == 1) & near)
-    land_indices = np.flatnonzero((classes == 0) & near)
-    xy_m = np.column_stack(
-        [centroids[:, 0] * raster_w * resolution, centroids[:, 1] * raster_h * resolution]
-    )
+    pairs = _triangle_adjacencies(mesh["simplices"])
+    pair_classes = classes[pairs]
     lab = _lab_under_d65(bases)
-    land_tree = cKDTree(xy_m[land_indices])
-    lost_distance, lost_neighbor = land_tree.query(xy_m[lost_indices], k=1)
-    lost_land_delta = np.linalg.norm(
-        lab[lost_indices] - lab[land_indices[lost_neighbor]], axis=1
+    adjacent_delta = np.linalg.norm(lab[pairs[:, 0]] - lab[pairs[:, 1]], axis=1)
+    land_land = (pair_classes[:, 0] == 0) & (pair_classes[:, 1] == 0)
+    lost_land = (
+        ((pair_classes[:, 0] == 1) & (pair_classes[:, 1] == 0))
+        | ((pair_classes[:, 0] == 0) & (pair_classes[:, 1] == 1))
     )
-    land_distance, land_neighbor = land_tree.query(xy_m[land_indices], k=2)
-    land_land_delta = np.linalg.norm(
-        lab[land_indices] - lab[land_indices[land_neighbor[:, 1]]], axis=1
-    )
+    land_family = np.isin(pair_classes, (0, 1, 3)).all(axis=1)
+    land_land_delta = adjacent_delta[land_land]
+    lost_land_delta = adjacent_delta[lost_land]
+    family_delta = adjacent_delta[land_family]
+    statistic = ks_2samp(land_land_delta, lost_land_delta, method="auto")
+    land_median = float(np.median(land_land_delta))
+    lost_median = float(np.median(lost_land_delta))
+    median_relative_difference = abs(lost_median - land_median) / land_median
+    family_median = float(np.median(family_delta))
     return {
-        "shoreline_distance_limit_km": 5.0,
+        "method": "shared-edge triangle adjacency under D65",
         "lost_land_pair_count": int(len(lost_land_delta)),
         "land_land_pair_count": int(len(land_land_delta)),
-        "median_delta_e76_d65_lost_to_land": float(np.median(lost_land_delta)),
+        "land_family_pair_count": int(len(family_delta)),
+        "median_delta_e76_d65_lost_to_land": lost_median,
         "p90_delta_e76_d65_lost_to_land": float(np.percentile(lost_land_delta, 90)),
-        "median_delta_e76_d65_land_to_land": float(np.median(land_land_delta)),
+        "median_delta_e76_d65_land_to_land": land_median,
         "p90_delta_e76_d65_land_to_land": float(np.percentile(land_land_delta, 90)),
-        "median_lost_to_land_distance_m": float(np.median(lost_distance)),
-        "median_land_to_land_distance_m": float(np.median(land_distance[:, 1])),
-        "target_lost_to_land_delta_e76": 3.0,
-        "passes_target": bool(np.median(lost_land_delta) < 3.0),
+        "median_delta_e76_d65_adjacent_land_family": family_median,
+        "ks_statistic": float(statistic.statistic),
+        "ks_pvalue": float(statistic.pvalue),
+        "median_relative_difference": float(median_relative_difference),
+        "targets": {
+            "ks_pvalue_minimum_exclusive": 0.05,
+            "median_relative_difference_maximum": 0.10,
+            "adjacent_land_family_median_delta_e76_range": [3.0, 6.0],
+        },
+        "passes_target": bool(
+            statistic.pvalue > 0.05
+            and median_relative_difference <= 0.10
+            and 3.0 <= family_median <= 6.0
+        ),
     }
 
 
@@ -557,7 +616,7 @@ def solve_metamers(seed: int = SEED) -> dict:
     d65_xyz_difference = np.max(
         np.abs(spectra_to_xyz(final, D65_SPD) - spectra_to_xyz(bases, D65_SPD))
     )
-    camouflage = _shoreline_camouflage(mesh, bases)
+    camouflage = _adjacent_camouflage(mesh, bases)
     base_reflectance = {
         label: {
             "sample_median": float(np.median(bases[classes == class_value])),
@@ -575,9 +634,12 @@ def solve_metamers(seed: int = SEED) -> dict:
         "illuminant_a_kelvin": ILLUMINANT_A_K,
         "chromatic_adaptation_degree": ADAPTATION,
         "base_spectra": (
-            "lost_water, land, and managed cells share one continuous earth/sage "
-            "smooth_field family"
+            "lost_water, land, and managed cells share one earth/sage smooth_field "
+            "family with deterministic per-cell facet variation"
         ),
+        "recommended_water_variant": RECOMMENDED_WATER_VARIANT,
+        "water_variants_lstar": WATER_VARIANTS,
+        "land_cell_variation_sigma": LAND_CELL_VARIATION_SIGMA,
         "base_reflectance_by_class": base_reflectance,
         "d65_camouflage": camouflage,
         "d65_constraint": "exact linear XYZ equality in a projected spectral nullspace",

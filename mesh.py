@@ -26,6 +26,7 @@ SHORELINE_ANCHORS = 800
 FRAME_SAMPLES_PER_EDGE = 34
 LLOYD_ITERATIONS = 2
 DENSITY_STRIDE = 8
+HEALTHY_CROP_MARGIN = 0.06
 MESH_PATH = DATA_DIR / "gsl_mesh_phase2.npz"
 MESH_REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "mesh_report.json"
 
@@ -68,6 +69,31 @@ def _largest_valid_rectangle(valid: np.ndarray) -> tuple[int, int, int, int]:
     return best
 
 
+def _tight_healthy_crop(
+    classes: np.ndarray,
+    valid: np.ndarray,
+    margin_fraction: float = HEALTHY_CROP_MARGIN,
+) -> tuple[int, int, int, int]:
+    """Bound the 4,198 ft extent with a six-percent margin on every side."""
+    rows, columns = np.where(np.isin(classes, (1, 2)))
+    if not len(rows):
+        raise RuntimeError("Healthy lake extent is empty")
+    height = int(rows.max() - rows.min() + 1)
+    width = int(columns.max() - columns.min() + 1)
+    row_margin = int(np.ceil(height * margin_fraction))
+    column_margin = int(np.ceil(width * margin_fraction))
+    window = (
+        max(0, int(rows.min()) - row_margin),
+        min(classes.shape[0], int(rows.max()) + row_margin + 1),
+        max(0, int(columns.min()) - column_margin),
+        min(classes.shape[1], int(columns.max()) + column_margin + 1),
+    )
+    row0, row1, col0, col1 = window
+    if not valid[row0:row1, col0:col1].all():
+        raise RuntimeError("Tight healthy-extent crop intersects source no-data")
+    return window
+
+
 def _sample_weighted_points(
     occurrence: np.ndarray,
     classes: np.ndarray,
@@ -83,10 +109,9 @@ def _sample_weighted_points(
     if np.any(valid):
         scale = np.percentile(gradient[valid], 98)
         gradient = np.clip(gradient / max(scale, 1e-6), 0.0, 1.0)
-    healthy_edge = _edge(np.isin(small_classes, (1, 2)))
     current_edge = _edge(small_classes == 2)
     shoreline = ndimage.gaussian_filter(
-        (healthy_edge | current_edge).astype(np.float32), sigma=2.0
+        current_edge.astype(np.float32), sigma=2.0
     )
     if shoreline.max() > 0:
         shoreline /= shoreline.max()
@@ -109,10 +134,9 @@ def _sample_weighted_points(
 def _shoreline_points(
     classes: np.ndarray, rng: np.random.Generator
 ) -> np.ndarray:
-    """Keep fixed anchors on both accepted shorelines after Lloyd relaxation."""
-    healthy = _edge(np.isin(classes, (1, 2)))
+    """Anchor the visible current shoreline without outlining hidden lost water."""
     current = _edge(classes == 2)
-    candidates = np.argwhere(healthy | current)
+    candidates = np.argwhere(current)
     if len(candidates) <= SHORELINE_ANCHORS:
         selected = candidates
     else:
@@ -199,8 +223,9 @@ def build_mesh(seed: int = SEED) -> dict:
     raster_arms = np.broadcast_to(
         (row_y[:, None] >= causeway_y[0]).astype(np.uint8), classes.shape
     )
-    crop_window = _largest_valid_rectangle(
-        np.isfinite(occurrence) & (classes != 255)
+    crop_window = _tight_healthy_crop(
+        classes,
+        np.isfinite(occurrence) & (classes != 255),
     )
     row0, row1, col0, col1 = crop_window
     occurrence = occurrence[row0:row1, col0:col1]
@@ -244,9 +269,14 @@ def build_mesh(seed: int = SEED) -> dict:
         "lloyd_iterations": LLOYD_ITERATIONS,
         "shoreline_anchors": int(len(anchors)),
         "valid_data_crop": {
+            "method": "4,198 ft extent plus six-percent margin on each side",
+            "margin_fraction_each_side": HEALTHY_CROP_MARGIN,
             "original_raster_shape": list(original_shape),
             "window_row0_row1_col0_col1": list(crop_window),
             "cropped_raster_shape": list(classes.shape),
+            "aspect_ratio_width_over_height": float(
+                classes.shape[1] / classes.shape[0]
+            ),
             "contains_nodata": bool(np.any(classes == 255)),
             "frame_boundary_points": FRAME_SAMPLES_PER_EDGE * 4,
         },
@@ -288,7 +318,10 @@ def build_mesh(seed: int = SEED) -> dict:
             "north": "Gunnison Bay",
             "south": "Gilbert Bay, Bear River Bay, and Farmington Bay",
         },
-        "density": "JRC occurrence-gradient magnitude with boosts at both accepted shoreline masks",
+        "density": (
+            "JRC occurrence-gradient magnitude with a boost at the visible current "
+            "shoreline only; the hidden 4,198 ft boundary has no geometry cue"
+        ),
     }
     MESH_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
     MESH_REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

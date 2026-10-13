@@ -12,7 +12,14 @@ from PIL import Image, ImageDraw, ImageFont
 from data import DATA_DIR
 from engine import ADAPTATION, D65_SPD, adapt, illuminant, spectra_to_xyz, xyz_to_srgb
 from mesh import MESH_PATH
-from metamers import ILLUMINANT_A_K, SPECTRA_BASE_PATH, SPECTRA_FINAL_PATH
+from metamers import (
+    ILLUMINANT_A_K,
+    RECOMMENDED_WATER_VARIANT,
+    SPECTRA_BASE_PATH,
+    SPECTRA_FINAL_PATH,
+    WATER_VARIANTS,
+    build_water_spectra,
+)
 
 
 PHASE2_DIR = DATA_DIR.parent / "out" / "phase2"
@@ -21,6 +28,7 @@ PREVIEW_A_PATH = PHASE2_DIR / "preview_2856k.png"
 PREVIEW_MIDPOINT_PATH = PHASE2_DIR / "preview_midpoint.png"
 PREVIEW_PAIR_PATH = PHASE2_DIR / "preview_pair.png"
 PREVIEW_TRIPTYCH_PATH = PHASE2_DIR / "preview_triptych.png"
+WATER_VARIANT_COMPARISON_PATH = PHASE2_DIR / "water_variants_2856k.png"
 D65_BASELINE_PATH = PHASE2_DIR / "d65_baseline.png"
 RENDER_REPORT_PATH = PHASE2_DIR / "render_report.json"
 
@@ -79,6 +87,20 @@ def render_mesh(
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _median_lstar(spectra: np.ndarray) -> float:
+    white_y = spectra_to_xyz(
+        np.ones((1, spectra.shape[1])), D65_SPD
+    )[0, 1]
+    y_ratio = spectra_to_xyz(spectra, D65_SPD)[:, 1] / white_y
+    delta = 6.0 / 29.0
+    lightness = np.where(
+        y_ratio > delta**3,
+        116.0 * np.cbrt(y_ratio) - 16.0,
+        y_ratio * (29.0 / 3.0) ** 3,
+    )
+    return float(np.median(lightness))
 
 
 def render_previews(long_side: int = 1600) -> dict:
@@ -172,13 +194,75 @@ def render_previews(long_side: int = 1600) -> dict:
         triptych_draw.text((x, 16), label, font=label_font, fill=(41, 48, 43))
     triptych.save(PREVIEW_TRIPTYCH_PATH, optimize=True)
 
+    water_variant_images: dict[str, Image.Image] = {}
+    water_variant_lstar: dict[str, dict[str, float]] = {}
+    for variant in WATER_VARIANTS:
+        variant_spectra = final.copy()
+        water_spectra = build_water_spectra(
+            mesh["centroids"], mesh["arms"], variant
+        )
+        variant_spectra[classes == 2] = water_spectra[classes == 2]
+        variant_colours = spectral_colours(variant_spectra, ILLUMINANT_A_K)
+        water_variant_images[variant] = render_mesh(
+            points,
+            simplices,
+            classes,
+            variant_colours,
+            raster_shape,
+            long_side,
+        )
+        water_variant_lstar[variant] = {
+            "north_median": _median_lstar(
+                water_spectra[(classes == 2) & (mesh["arms"] == 1)]
+            ),
+            "south_median": _median_lstar(
+                water_spectra[(classes == 2) & (mesh["arms"] == 0)]
+            ),
+        }
+
+    comparison_width = 1600
+    comparison_gap = 12
+    comparison_panel_width = (comparison_width - 2 * comparison_gap) // 3
+    comparison_panel_height = int(
+        round(d65.height * comparison_panel_width / d65.width)
+    )
+    comparison = Image.new(
+        "RGB", (comparison_width, comparison_panel_height), (244, 241, 232)
+    )
+    comparison_draw = ImageDraw.Draw(comparison)
+    for panel_index, variant in enumerate(WATER_VARIANTS):
+        panel = water_variant_images[variant].resize(
+            (comparison_panel_width, comparison_panel_height),
+            Image.Resampling.LANCZOS,
+        )
+        x0 = panel_index * (comparison_panel_width + comparison_gap)
+        comparison.paste(panel, (x0, 0))
+        target = WATER_VARIANTS[variant]
+        label = f"{variant} — dark" if target is None else f"{variant} — L* {target:.0f}"
+        x = x0 + 18
+        box = comparison_draw.textbbox((x, 16), label, font=label_font)
+        comparison_draw.rounded_rectangle(
+            (box[0] - 7, box[1] - 4, box[2] + 7, box[3] + 4),
+            radius=5,
+            fill=(244, 241, 232),
+        )
+        comparison_draw.text((x, 16), label, font=label_font, fill=(41, 48, 43))
+    comparison.save(WATER_VARIANT_COMPARISON_PATH, optimize=True)
+
     baseline_array = np.asarray(baseline, dtype=np.int16)
     d65_array = np.asarray(d65, dtype=np.int16)
+    aspect_ratio = d65.width / d65.height
+    rotated_aspect_ratio = 1.0 / aspect_ratio
+    target_aspect_ratio = 16.0 / 9.0
     report = {
         "long_side_px": long_side,
         "individual_size_px": [d65.width, d65.height],
         "pair_size_px": [pair.width, pair.height],
         "triptych_size_px": [triptych.width, triptych.height],
+        "water_variant_comparison_size_px": [
+            comparison.width,
+            comparison.height,
+        ],
         "d65_max_abs_pixel_difference": int(
             np.max(np.abs(baseline_array - d65_array))
         ),
@@ -190,8 +274,21 @@ def render_previews(long_side: int = 1600) -> dict:
             "midpoint": _sha256(PREVIEW_MIDPOINT_PATH),
             "pair": _sha256(PREVIEW_PAIR_PATH),
             "triptych": _sha256(PREVIEW_TRIPTYCH_PATH),
+            "water_variants_2856k": _sha256(WATER_VARIANT_COMPARISON_PATH),
         },
         "midpoint_illuminant": "50% D65 SPD + 50% 2856 K SPD",
+        "recommended_water_variant": RECOMMENDED_WATER_VARIANT,
+        "water_variant_d65_lstar": water_variant_lstar,
+        "framing": {
+            "tight_crop_aspect_ratio_width_over_height": aspect_ratio,
+            "rotated_aspect_ratio_width_over_height": rotated_aspect_ratio,
+            "film_aspect_ratio": target_aspect_ratio,
+            "recommended_fit": "rotate 90 degrees, then pad left and right to 16:9",
+            "rotated_width_fraction_of_16_9_frame": (
+                rotated_aspect_ratio / target_aspect_ratio
+            ),
+            "film_settings_changed": False,
+        },
     }
     RENDER_REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

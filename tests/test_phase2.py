@@ -44,15 +44,21 @@ def test_daylight_camouflage_and_per_arm_reveal_trials() -> None:
     metamers = report()["metamers"]
     camouflage = metamers["d65_camouflage"]
     assert camouflage["passes_target"] is True
-    assert camouflage["median_delta_e76_d65_lost_to_land"] < 3.0
-    assert len(metamers["option_sweep"]) == 18
+    assert camouflage["ks_pvalue"] > 0.05
+    assert camouflage["median_relative_difference"] <= 0.10
+    assert 3.0 <= camouflage["median_delta_e76_d65_adjacent_land_family"] <= 6.0
+    assert len(metamers["option_sweep"]) == 24
     assert {row["smoothness_weight"] for row in metamers["option_sweep"]} == {
         20.0,
         50.0,
         200.0,
     }
     assert {row["angle_degrees"] for row in metamers["option_sweep"] if row["arm"] == "north"} == {0.0, 15.0, -15.0}
-    assert {row["angle_degrees"] for row in metamers["option_sweep"] if row["arm"] == "south"} == {-180.0, -165.0, -150.0}
+    assert {
+        row["angle_degrees"]
+        for row in metamers["option_sweep"]
+        if row["arm"] == "south"
+    } == {-180.0, -175.0, -170.0, -165.0, -150.0}
     for arm in metamers["arms"].values():
         assert arm["final"]["median_delta_e76_a"] >= 15.0
         assert arm["final"]["mean_coherence"] >= 0.90
@@ -68,6 +74,8 @@ def test_render_crop_has_no_nodata_triangles() -> None:
     mesh = report()["mesh"]
     assert mesh["valid_data_crop"]["contains_nodata"] is False
     assert mesh["class_triangle_counts"]["nodata"] == 0
+    assert mesh["valid_data_crop"]["margin_fraction_each_side"] == 0.06
+    assert 0.75 < mesh["valid_data_crop"]["aspect_ratio_width_over_height"] < 0.80
 
 
 def test_causeway_arm_split_and_current_water_colours() -> None:
@@ -93,3 +101,16 @@ def test_midpoint_preview_exists() -> None:
     midpoint = Image.open(ROOT / "out" / "phase2" / "preview_midpoint.png")
     assert max(midpoint.size) == 1600
     assert report()["render"]["midpoint_illuminant"] == "50% D65 SPD + 50% 2856 K SPD"
+
+
+def test_water_variants_and_framing_report() -> None:
+    result = report()["render"]
+    comparison = Image.open(ROOT / "out" / "phase2" / "water_variants_2856k.png")
+    assert comparison.width == 1600
+    assert result["recommended_water_variant"] == "B"
+    for arm in ("north_median", "south_median"):
+        assert abs(result["water_variant_d65_lstar"]["B"][arm] - 45.0) < 1.0
+        assert abs(result["water_variant_d65_lstar"]["C"][arm] - 55.0) < 1.0
+    framing = result["framing"]
+    assert framing["film_settings_changed"] is False
+    assert framing["recommended_fit"] == "rotate 90 degrees, then pad left and right to 16:9"
