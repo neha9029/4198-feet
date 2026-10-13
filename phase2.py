@@ -14,6 +14,12 @@ REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "phase2_report.json"
 
 
 def _write_report(seed: int, mesh: dict, metamers: dict, render: dict) -> dict:
+    arm_targets_pass = all(
+        arm["final"]["median_delta_e76_a"] >= 15.0
+        and arm["final"]["mean_coherence"] >= 0.90
+        and arm["final"]["failure_rate"] == 0.0
+        for arm in metamers["arms"].values()
+    )
     tests_pass = bool(
         metamers["deterministic_repeat_equal"]
         and metamers["repeat_success_pattern_equal"]
@@ -24,12 +30,14 @@ def _write_report(seed: int, mesh: dict, metamers: dict, render: dict) -> dict:
         and mesh["valid_data_crop"]["contains_nodata"] is False
         and mesh["class_triangle_counts"]["nodata"] == 0
         and render["d65_identity"]
+        and arm_targets_pass
     )
     report = {
         "seed": seed,
         "mesh": mesh,
         "metamers": metamers,
         "render": render,
+        "arm_reveal_targets_pass": arm_targets_pass,
         "tests_pass": tests_pass,
     }
     REPORT_PATH.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

@@ -30,16 +30,19 @@ from mesh import MESH_PATH
 LOW = 0.015
 HIGH = 0.96
 ILLUMINANT_A_K = 2856
-SMOOTHNESS_WEIGHTS = (50.0, 100.0, 200.0)
-DIRECTION_OPTIONS = ("fixed_blue_green", "toward_water")
-SWEEP_SAMPLE_SIZE = 64
+SMOOTHNESS_WEIGHTS = (20.0, 50.0, 200.0)
+ARM_ANGLES = {
+    "north": (0.0, 15.0, -15.0),
+    "south": (-180.0, -165.0, -150.0),
+}
+SWEEP_SAMPLE_SIZE_PER_ARM = 64
 NULL_BASIS_SIZE = 12
-PROJECTION_GAIN = 450.0
-ORTHOGONAL_WEIGHT = 35.0
-COEFFICIENT_WEIGHT = 0.001
+PROJECTION_GAIN = 10.0
+ORTHOGONAL_WEIGHT = 2.0
+SEEDED_RESTARTS = 5
 DEPTH_STRENGTH_MIN = 0.60
 TARGET_MEDIAN_DELTA_E = 15.0
-TARGET_COHERENCE = 0.85
+TARGET_COHERENCE = 0.90
 SPECTRA_BASE_PATH = DATA_DIR / "phase2_base_spectra.npy"
 SPECTRA_FINAL_PATH = DATA_DIR / "phase2_final_spectra.npy"
 REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "metamer_report.json"
@@ -51,8 +54,8 @@ def _gaussian(centre: float, sigma: float) -> np.ndarray:
 
 def build_spectral_families(
     centroids: np.ndarray, seed: int = SEED
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return continuous earth/sage land and dark blue-green water families."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return continuous land plus fixed north/south current-water spectra."""
     rng = np.random.default_rng(seed)
     field_a = smooth_field(centroids, rng, waves=4, scale=1.15)
     field_b = smooth_field(centroids, rng, waves=3, scale=2.05)
@@ -67,33 +70,43 @@ def build_spectral_families(
     land = land * (0.86 + 0.22 * ((field_a + 1.0) / 2.0))[:, None]
     land += (0.020 * field_b + 0.010 * field_c)[:, None]
 
-    water = (
-        0.030
-        + 0.118 * _gaussian(500, 64)[None, :]
-        + 0.030 * _gaussian(438, 46)[None, :]
-        - 0.016 * _gaussian(650, 78)[None, :]
+    north_water = (
+        0.018
+        + 0.070 * _gaussian(430, 45)
+        + 0.090 * _gaussian(660, 60)
+        - 0.015 * _gaussian(530, 55)
     )
-    water = water * (0.78 + 0.23 * ((field_c + 1.0) / 2.0))[:, None]
-    water += (0.006 * field_a)[:, None]
-    return np.clip(land, LOW, HIGH), np.clip(water, LOW, HIGH)
+    south_water = (
+        0.018
+        + 0.110 * _gaussian(490, 55)
+        + 0.050 * _gaussian(535, 65)
+        - 0.020 * _gaussian(650, 75)
+    )
+    return (
+        np.clip(land, LOW, HIGH),
+        np.clip(north_water, LOW, HIGH),
+        np.clip(south_water, LOW, HIGH),
+    )
 
 
 def build_base_spectra(
     centroids: np.ndarray,
     classes: np.ndarray,
+    arms: np.ndarray,
     occurrence: np.ndarray,
     seed: int = SEED,
     *,
     return_water_reference: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Assign lost water, land, and managed cells to one continuous land family."""
     del occurrence  # Class-independent land continuity is deliberate.
-    land, water = build_spectral_families(centroids, seed)
+    land, north_water, south_water = build_spectral_families(centroids, seed)
     spectra = land.copy()
-    spectra[classes == 2] = water[classes == 2]
+    spectra[(classes == 2) & (arms == 1)] = north_water
+    spectra[(classes == 2) & (arms == 0)] = south_water
     spectra[classes == 255] = 0.18
     if return_water_reference:
-        return spectra, water
+        return spectra, {"north": north_water, "south": south_water}
     return spectra
 
 
@@ -154,36 +167,32 @@ def _lab_under_a(spectra: np.ndarray) -> np.ndarray:
     return _lab(adapt(xyz, source_white, d65_white, ADAPTATION), d65_white)
 
 
-def _fixed_blue_green_direction() -> np.ndarray:
-    radians = np.deg2rad(-135.0)
-    vector = np.array([-0.12, np.cos(radians), np.sin(radians)], dtype=float)
-    return vector / np.linalg.norm(vector)
+def _angle_direction(angle_degrees: float) -> np.ndarray:
+    """Return a unit Lab direction with zero lightness component."""
+    radians = np.deg2rad(angle_degrees)
+    return np.array([0.0, np.cos(radians), np.sin(radians)], dtype=float)
 
 
-def _directions(
-    option: str,
-    indices: np.ndarray,
-    bases_lab_a: np.ndarray,
-    water_lab_a: np.ndarray,
+def _bounded_scale(base: np.ndarray, delta: np.ndarray) -> float:
+    """Largest scale in [0, 1] that keeps base + scale * delta in bounds."""
+    alpha = 1.0
+    falling = delta < 0.0
+    rising = delta > 0.0
+    if np.any(falling):
+        alpha = min(alpha, float(np.min((base[falling] - LOW) / -delta[falling])))
+    if np.any(rising):
+        alpha = min(alpha, float(np.min((HIGH - base[rising]) / delta[rising])))
+    return max(0.0, min(1.0, alpha) * (1.0 - 1e-10))
+
+
+def _seeded_restart(
+    base: np.ndarray, basis: np.ndarray, rng: np.random.Generator
 ) -> np.ndarray:
-    if option == "fixed_blue_green":
-        return np.repeat(_fixed_blue_green_direction()[None, :], len(indices), axis=0)
-    delta = water_lab_a[indices] - bases_lab_a[indices]
-    norm = np.linalg.norm(delta, axis=1, keepdims=True)
-    fallback = _fixed_blue_green_direction()
-    return np.where(norm > 1e-10, delta / np.maximum(norm, 1e-10), fallback)
-
-
-def _feasible_start(
-    base: np.ndarray, basis: np.ndarray, rng: np.random.Generator, scale: float
-) -> np.ndarray:
-    for _ in range(10):
-        z = rng.normal(0.0, scale, size=basis.shape[1])
-        spectrum = base + basis @ z
-        if spectrum.min() >= LOW and spectrum.max() <= HIGH:
-            return z
-        scale *= 0.62
-    return np.zeros(basis.shape[1])
+    """Project clip(r0 + N(0, 0.15)) into the exact D65 nullspace."""
+    perturbed = np.clip(base + rng.normal(0.0, 0.15, size=base.shape), LOW, HIGH)
+    z = basis.T @ (perturbed - base)
+    delta = basis @ z
+    return z * _bounded_scale(base, delta)
 
 
 def _solve_one(
@@ -213,20 +222,13 @@ def _solve_one(
             -PROJECTION_GAIN * strength * projection
             + ORTHOGONAL_WEIGHT * float(orthogonal @ orthogonal)
             + smoothness_weight * float(roughness @ roughness)
-            + COEFFICIENT_WEIGHT * float(z @ z)
         )
 
     def bounds_constraint(z: np.ndarray) -> np.ndarray:
         spectrum = base + basis @ z
         return np.concatenate([spectrum - LOW, HIGH - spectrum])
 
-    starts = [np.zeros(basis.shape[1])]
-    for candidate_index in range(40):
-        scale = 0.08 + 0.72 * (candidate_index / 39.0)
-        z0 = _feasible_start(base, basis, rng, scale)
-        if np.any(z0):
-            starts.append(z0)
-    starts = sorted(starts, key=objective)[:restarts]
+    starts = [_seeded_restart(base, basis, rng) for _ in range(restarts)]
 
     best_z = starts[0]
     best_fun = objective(best_z)
@@ -238,7 +240,7 @@ def _solve_one(
             z0,
             method="SLSQP",
             constraints=({"type": "ineq", "fun": bounds_constraint},),
-            options={"maxiter": 90, "ftol": 2e-9, "disp": False},
+            options={"maxiter": 140, "ftol": 2e-9, "disp": False},
         )
         optimizer_succeeded = optimizer_succeeded or bool(result.success)
         if result.fun < best_fun:
@@ -247,19 +249,7 @@ def _solve_one(
             best_iterations = int(result.nit)
 
     delta_spectrum = basis @ best_z
-    alpha = 1.0
-    falling = delta_spectrum < 0.0
-    rising = delta_spectrum > 0.0
-    if np.any(falling):
-        alpha = min(
-            alpha, float(np.min((base[falling] - LOW) / -delta_spectrum[falling]))
-        )
-    if np.any(rising):
-        alpha = min(
-            alpha, float(np.min((HIGH - base[rising]) / delta_spectrum[rising]))
-        )
-    if alpha < 1.0:
-        alpha = max(0.0, alpha * (1.0 - 1e-10))
+    alpha = _bounded_scale(base, delta_spectrum)
     solved = base + alpha * delta_spectrum
 
     shift = _lab_under_a(solved[None, :])[0] - baseline_lab
@@ -293,10 +283,10 @@ def _solve_one(
 
 
 def _sample_lost_indices(lost_indices: np.ndarray) -> np.ndarray:
-    if len(lost_indices) <= SWEEP_SAMPLE_SIZE:
+    if len(lost_indices) <= SWEEP_SAMPLE_SIZE_PER_ARM:
         return lost_indices
     locations = np.rint(
-        np.linspace(0, len(lost_indices) - 1, SWEEP_SAMPLE_SIZE)
+        np.linspace(0, len(lost_indices) - 1, SWEEP_SAMPLE_SIZE_PER_ARM)
     ).astype(int)
     return lost_indices[locations]
 
@@ -315,78 +305,115 @@ def _summarise(diagnostics: list[dict]) -> dict:
     }
 
 
-def _run_option(
-    option: str,
+def _run_trial(
+    arm: str,
+    angle_degrees: float,
     smoothness_weight: float,
     sample_indices: np.ndarray,
     bases: np.ndarray,
     depths: np.ndarray,
-    directions: np.ndarray,
     basis: np.ndarray,
 ) -> dict:
+    direction = _angle_direction(angle_degrees)
     diagnostics = []
     for order, triangle_index in enumerate(sample_indices):
         _, diagnostic = _solve_one(
             bases[triangle_index],
             depths[triangle_index],
-            directions[order],
+            direction,
             smoothness_weight,
             basis,
-            SEED + DIRECTION_OPTIONS.index(option) * 100_000 + int(smoothness_weight) * 100 + order,
-            restarts=2,
+            (
+                SEED
+                + (0 if arm == "south" else 1_000_000)
+                + int(round(angle_degrees + 180.0)) * 10_000
+                + int(smoothness_weight) * 100
+                + order
+            ),
+            restarts=SEEDED_RESTARTS,
         )
         diagnostics.append(diagnostic)
     return {
-        "option": option,
+        "arm": arm,
+        "angle_degrees": angle_degrees,
         "smoothness_weight": smoothness_weight,
         "sample_count": int(len(sample_indices)),
         **_summarise(diagnostics),
     }
 
 
-def _choose_option(sweep: list[dict]) -> dict:
-    passing = [
+def _choose_arm_trial(arm: str, sweep: list[dict]) -> dict:
+    coherent = [
         item
         for item in sweep
-        if item["median_delta_e76_a"] >= TARGET_MEDIAN_DELTA_E
-        and item["mean_coherence"] >= TARGET_COHERENCE
-        and item["failure_rate"] <= 0.05
+        if item["mean_coherence"] >= TARGET_COHERENCE
+        and item["failure_rate"] == 0.0
     ]
-    pool = passing or [item for item in sweep if item["failure_rate"] <= 0.05] or sweep
-    chosen = max(
-        pool,
-        key=lambda item: item["median_delta_e76_a"]
-        + 0.25 * item["min_delta_e76_a"]
-        + 5.0 * item["mean_coherence"]
-        - 30.0 * item["failure_rate"],
-    )
+    passing = [
+        item for item in coherent if item["median_delta_e76_a"] >= TARGET_MEDIAN_DELTA_E
+    ]
+    if arm == "north":
+        pool = coherent or [item for item in sweep if item["failure_rate"] == 0.0] or sweep
+        chosen = max(pool, key=lambda item: item["median_delta_e76_a"])
+    else:
+        # In CIELAB, moving from -180 toward -150 adds negative b* and is the
+        # requested progression from green toward blue-green.
+        if passing:
+            bluest_angle = max(item["angle_degrees"] for item in passing)
+            pool = [item for item in passing if item["angle_degrees"] == bluest_angle]
+            chosen = max(pool, key=lambda item: item["median_delta_e76_a"])
+        else:
+            pool = coherent or [item for item in sweep if item["failure_rate"] == 0.0] or sweep
+            chosen = max(pool, key=lambda item: item["median_delta_e76_a"])
     return {**chosen, "meets_target": chosen in passing}
 
 
-def _solve_all_lost(
+def _solve_indices(
     bases: np.ndarray,
-    classes: np.ndarray,
+    indices: np.ndarray,
     depths: np.ndarray,
-    directions: np.ndarray,
+    direction: np.ndarray,
     smoothness_weight: float,
     basis: np.ndarray,
+    seed_offset: int,
 ) -> tuple[np.ndarray, list[dict]]:
-    final = bases.copy()
-    lost_indices = np.flatnonzero(classes == 1)
+    solved = bases.copy()
     diagnostics: list[dict] = []
-    for order, triangle_index in enumerate(lost_indices):
-        final[triangle_index], diagnostic = _solve_one(
+    for triangle_index in indices:
+        solved[triangle_index], diagnostic = _solve_one(
             bases[triangle_index],
             depths[triangle_index],
-            directions[order],
+            direction,
             smoothness_weight,
             basis,
-            SEED + 900_000 + order,
-            restarts=2,
+            SEED + seed_offset + int(triangle_index),
+            restarts=SEEDED_RESTARTS,
         )
         diagnostic["triangle_index"] = int(triangle_index)
         diagnostics.append(diagnostic)
-    return final, diagnostics
+    return solved, diagnostics
+
+
+def _depth_terciles(diagnostics: list[dict], depths: np.ndarray) -> list[dict]:
+    """Summarise reveal strength from shallow edge through deepest lost cells."""
+    if not diagnostics:
+        return []
+    ordered = sorted(diagnostics, key=lambda item: depths[item["triangle_index"]])
+    rows = []
+    for label, group in zip(("shallow", "middle", "deep"), np.array_split(ordered, 3)):
+        items = list(group)
+        group_depth = np.array([depths[item["triangle_index"]] for item in items])
+        delta_e = np.array([item["delta_e76"] for item in items])
+        rows.append(
+            {
+                "tercile": label,
+                "triangle_count": len(items),
+                "depth_min_ft": float(group_depth.min()),
+                "depth_max_ft": float(group_depth.max()),
+                "median_delta_e76_a": float(np.median(delta_e)),
+            }
+        )
+    return rows
 
 
 def _shoreline_camouflage(
@@ -441,65 +468,91 @@ def _shoreline_camouflage(
 
 
 def solve_metamers(seed: int = SEED) -> dict:
-    """Run the six reveal trials, solve all lost cells, and verify identity."""
+    """Sweep per-arm reveal directions, solve all lost cells, and verify identity."""
     mesh = np.load(MESH_PATH)
     centroids = mesh["centroids"]
     classes = mesh["classes"]
+    arms = mesh["arms"]
     depths_ft = np.nan_to_num(mesh["lost_depth"], nan=0.0)
     occurrence = np.nan_to_num(mesh["occurrence"], nan=0.0)
     depth_fraction = np.clip(depths_ft / 8.4, 0.0, 1.0)
-    bases, water_reference = build_base_spectra(
+    bases = build_base_spectra(
         centroids,
         classes,
+        arms,
         occurrence,
         seed,
-        return_water_reference=True,
     )
     basis = _null_basis()
     lost_indices = np.flatnonzero(classes == 1)
-    sample_indices = _sample_lost_indices(lost_indices)
-    bases_lab_a = _lab_under_a(bases)
-    water_lab_a = _lab_under_a(water_reference)
-
-    sweep = []
-    for option in DIRECTION_OPTIONS:
-        sample_directions = _directions(
-            option, sample_indices, bases_lab_a, water_lab_a
-        )
-        for smoothness_weight in SMOOTHNESS_WEIGHTS:
-            sweep.append(
-                _run_option(
-                    option,
+    sweep: list[dict] = []
+    chosen_by_arm: dict[str, dict] = {}
+    arm_indices: dict[str, np.ndarray] = {}
+    for arm, arm_value in (("north", 1), ("south", 0)):
+        indices = np.flatnonzero((classes == 1) & (arms == arm_value))
+        arm_indices[arm] = indices
+        sample_indices = _sample_lost_indices(indices)
+        arm_sweep = []
+        for angle_degrees in ARM_ANGLES[arm]:
+            for smoothness_weight in SMOOTHNESS_WEIGHTS:
+                row = _run_trial(
+                    arm,
+                    angle_degrees,
                     smoothness_weight,
                     sample_indices,
                     bases,
                     depth_fraction,
-                    sample_directions,
                     basis,
                 )
-            )
-    chosen = _choose_option(sweep)
-    final_directions = _directions(
-        chosen["option"], lost_indices, bases_lab_a, water_lab_a
-    )
-    final, diagnostics = _solve_all_lost(
-        bases,
-        classes,
-        depth_fraction,
-        final_directions,
-        float(chosen["smoothness_weight"]),
-        basis,
-    )
-    repeated, repeated_diagnostics = _solve_all_lost(
-        bases,
-        classes,
-        depth_fraction,
-        final_directions,
-        float(chosen["smoothness_weight"]),
-        basis,
-    )
+                arm_sweep.append(row)
+                sweep.append(row)
+        chosen_by_arm[arm] = _choose_arm_trial(arm, arm_sweep)
+
+    final = bases.copy()
+    repeated = bases.copy()
+    diagnostics_by_arm: dict[str, list[dict]] = {}
+    repeated_by_arm: dict[str, list[dict]] = {}
+    for arm, seed_offset in (("north", 2_000_000), ("south", 3_000_000)):
+        chosen = chosen_by_arm[arm]
+        indices = arm_indices[arm]
+        solved, diagnostics = _solve_indices(
+            bases,
+            indices,
+            depth_fraction,
+            _angle_direction(float(chosen["angle_degrees"])),
+            float(chosen["smoothness_weight"]),
+            basis,
+            seed_offset,
+        )
+        repeated_solved, repeated_diagnostics = _solve_indices(
+            bases,
+            indices,
+            depth_fraction,
+            _angle_direction(float(chosen["angle_degrees"])),
+            float(chosen["smoothness_weight"]),
+            basis,
+            seed_offset,
+        )
+        final[indices] = solved[indices]
+        repeated[indices] = repeated_solved[indices]
+        diagnostics_by_arm[arm] = diagnostics
+        repeated_by_arm[arm] = repeated_diagnostics
+
+    diagnostics = diagnostics_by_arm["north"] + diagnostics_by_arm["south"]
+    repeated_diagnostics = repeated_by_arm["north"] + repeated_by_arm["south"]
     deterministic = bool(np.array_equal(final, repeated))
     final_summary = _summarise(diagnostics)
+    arm_results = {
+        arm: {
+            "chosen": chosen_by_arm[arm],
+            "triangle_count": int(len(arm_indices[arm])),
+            "final": _summarise(diagnostics_by_arm[arm]),
+            "depth_terciles": _depth_terciles(
+                diagnostics_by_arm[arm], depths_ft
+            ),
+        }
+        for arm in ("north", "south")
+    }
     xyz_errors = np.array([item["d65_xyz_max_error"] for item in diagnostics])
     d65_xyz_difference = np.max(
         np.abs(spectra_to_xyz(final, D65_SPD) - spectra_to_xyz(bases, D65_SPD))
@@ -530,21 +583,27 @@ def solve_metamers(seed: int = SEED) -> dict:
         "d65_constraint": "exact linear XYZ equality in a projected spectral nullspace",
         "objective": {
             "form": (
-                "maximise depth-scaled projection of delta Lab_A onto the target "
-                "direction, with orthogonal, second-difference, and coefficient penalties"
+                "-10 * depth_strength * projection + 2 * orthogonal_norm_squared "
+                "+ smoothness_weight * second_difference_norm_squared"
             ),
             "orthogonal_weight": ORTHOGONAL_WEIGHT,
             "projection_gain": PROJECTION_GAIN,
-            "coefficient_weight": COEFFICIENT_WEIGHT,
             "smoothness_weights_tested": list(SMOOTHNESS_WEIGHTS),
-            "depth_strength": "0.6 + 0.4 * normalised_depth",
+            "depth_strength": "0.6 + 0.4 * normalised_depth, applied to projection",
+            "seeded_restarts": SEEDED_RESTARTS,
+            "restart_initialisation": "project clip(r0 + N(0, 0.15)) into the D65 nullspace",
+            "lab_lightness_weight": 0.0,
         },
         "option_sweep": sweep,
-        "chosen_option": chosen,
+        "chosen_by_arm": chosen_by_arm,
+        "arms": arm_results,
         "target": {
             "median_delta_e76_a_minimum": TARGET_MEDIAN_DELTA_E,
             "coherence_minimum": TARGET_COHERENCE,
-            "achieved_in_sweep": bool(chosen["meets_target"]),
+            "achieved_in_sweep_by_arm": {
+                arm: bool(chosen_by_arm[arm]["meets_target"])
+                for arm in ("north", "south")
+            },
         },
         "lost_triangle_count": int(len(lost_indices)),
         "final": {

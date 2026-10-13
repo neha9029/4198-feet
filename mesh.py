@@ -9,8 +9,15 @@ import numpy as np
 import rasterio
 from scipy import ndimage
 from scipy.spatial import Delaunay
+from rasterio.warp import transform as warp_transform
 
-from data import DATA_DIR, OUT_DIR, SEED
+from data import (
+    CAUSEWAY_LAT,
+    CAUSEWAY_REFERENCE_LON,
+    DATA_DIR,
+    MEASUREMENT_CRS,
+    SEED,
+)
 from engine import lloyd_relax
 
 
@@ -173,10 +180,25 @@ def build_mesh(seed: int = SEED) -> dict:
         occurrence = dataset.read(1)
     with rasterio.open(DATA_DIR / "gsl_classes_utm12.tif") as dataset:
         classes = dataset.read(1)
+        class_transform = dataset.transform
     with rasterio.open(DATA_DIR / "gsl_lost_depth_ft_utm12.tif") as dataset:
         lost_depth = dataset.read(1)
 
     original_shape = classes.shape
+    _, causeway_y = warp_transform(
+        "EPSG:4326",
+        MEASUREMENT_CRS,
+        [CAUSEWAY_REFERENCE_LON],
+        [CAUSEWAY_LAT],
+    )
+    row_y = class_transform.f + (
+        np.arange(original_shape[0]) + 0.5
+    ) * class_transform.e
+    # 0 = south/Gilbert, 1 = north/Gunnison. The constant-latitude split also
+    # keeps Bear River and Farmington Bays with the south arm as requested.
+    raster_arms = np.broadcast_to(
+        (row_y[:, None] >= causeway_y[0]).astype(np.uint8), classes.shape
+    )
     crop_window = _largest_valid_rectangle(
         np.isfinite(occurrence) & (classes != 255)
     )
@@ -184,6 +206,7 @@ def build_mesh(seed: int = SEED) -> dict:
     occurrence = occurrence[row0:row1, col0:col1]
     classes = classes[row0:row1, col0:col1]
     lost_depth = lost_depth[row0:row1, col0:col1]
+    raster_arms = raster_arms[row0:row1, col0:col1]
 
     interior = _sample_weighted_points(occurrence, classes, rng)
     relaxed = lloyd_relax(interior, LLOYD_ITERATIONS)
@@ -196,6 +219,7 @@ def build_mesh(seed: int = SEED) -> dict:
     triangle_classes = _sample_raster(classes, centroids).astype(np.uint8)
     triangle_depth = _sample_raster(lost_depth, centroids).astype(np.float32)
     triangle_occurrence = _sample_raster(occurrence, centroids).astype(np.float32)
+    triangle_arms = _sample_raster(raster_arms, centroids).astype(np.uint8)
     mixed, mixed_fraction, contour_fraction = _mixed_fraction(
         points, simplices, classes
     )
@@ -207,6 +231,7 @@ def build_mesh(seed: int = SEED) -> dict:
         classes=triangle_classes,
         lost_depth=triangle_depth,
         occurrence=triangle_occurrence,
+        arms=triangle_arms,
         mixed=mixed,
         raster_shape=np.array(classes.shape, dtype=np.int32),
         original_raster_shape=np.array(original_shape, dtype=np.int32),
@@ -234,6 +259,34 @@ def build_mesh(seed: int = SEED) -> dict:
             "water_now": int(np.count_nonzero(triangle_classes == 2)),
             "managed": int(np.count_nonzero(triangle_classes == 3)),
             "nodata": int(np.count_nonzero(triangle_classes == 255)),
+        },
+        "lost_water_by_arm": {
+            "north": {
+                "area_km2": float(
+                    np.count_nonzero((classes == 1) & (raster_arms == 1))
+                    * abs(class_transform.a * class_transform.e)
+                    / 1_000_000.0
+                ),
+                "triangle_count": int(
+                    np.count_nonzero((triangle_classes == 1) & (triangle_arms == 1))
+                ),
+            },
+            "south": {
+                "area_km2": float(
+                    np.count_nonzero((classes == 1) & (raster_arms == 0))
+                    * abs(class_transform.a * class_transform.e)
+                    / 1_000_000.0
+                ),
+                "triangle_count": int(
+                    np.count_nonzero((triangle_classes == 1) & (triangle_arms == 0))
+                ),
+            },
+        },
+        "arm_split": {
+            "method": "railroad causeway reference latitude",
+            "latitude": CAUSEWAY_LAT,
+            "north": "Gunnison Bay",
+            "south": "Gilbert Bay, Bear River Bay, and Farmington Bay",
         },
         "density": "JRC occurrence-gradient magnitude with boosts at both accepted shoreline masks",
     }
