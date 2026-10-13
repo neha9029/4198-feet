@@ -178,14 +178,22 @@ def adapt(xyz, source_white, target_white, degree):
     return (lms * gain) @ np.linalg.inv(CAT02).T
 
 
-def xyz_to_srgb(xyz):
-    """Gamut-map by lifting toward the achromatic axis, then encode."""
+def xyz_to_srgb_float(xyz):
+    """Gamut-map and return gamma-encoded sRGB in the continuous 0–1 range."""
     rgb = xyz @ XYZ_TO_LINEAR_SRGB.T / 100.0
     rgb -= 0.4 * np.minimum(rgb.min(axis=1, keepdims=True), 0.0)
     rgb /= np.maximum(rgb.max(axis=1, keepdims=True), 1.0)
     rgb = np.clip(rgb, 0.0, 1.0)
-    encoded = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * rgb ** (1 / 2.4) - 0.055)
-    return np.rint(encoded * 255).astype(int)
+    return np.where(
+        rgb <= 0.0031308,
+        rgb * 12.92,
+        1.055 * rgb ** (1 / 2.4) - 0.055,
+    )
+
+
+def xyz_to_srgb(xyz):
+    """Gamut-map by lifting toward the achromatic axis, then encode."""
+    return np.rint(xyz_to_srgb_float(xyz) * 255).astype(int)
 
 
 # ----------------------------------------------------------------------------

@@ -13,6 +13,8 @@ from phase1_aoi import run_managed_aoi
 from phase2 import run_phase2
 from phase3 import run_phase3
 from mesh_density import build_density_comparison
+from relief import build_relief
+from film import render_phase4_preview
 
 
 def main() -> None:
@@ -28,7 +30,9 @@ def main() -> None:
             "phase1-aoi",
             "phase2",
             "phase2-density",
+            "phase2-relief",
             "phase3",
+            "phase4-preview",
         ),
     )
     args = parser.parse_args()
@@ -46,8 +50,12 @@ def main() -> None:
         print(json.dumps(run_phase2(), indent=2))
     elif args.phase == "phase2-density":
         print(json.dumps(build_density_comparison(), indent=2))
+    elif args.phase == "phase2-relief":
+        print(json.dumps(build_relief(), indent=2))
     elif args.phase == "phase3":
         print(json.dumps(run_phase3(), indent=2))
+    elif args.phase == "phase4-preview":
+        print(json.dumps(render_phase4_preview(), indent=2))
 
 
 if __name__ == "__main__":
