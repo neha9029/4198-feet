@@ -1,4 +1,4 @@
-"""Phase 4 preview renderer for the 0:40–0:50 light transition."""
+"""Phase 4 renderer for a visible ten-second preview of the light transition."""
 
 from __future__ import annotations
 
@@ -57,6 +57,13 @@ def mixture_amount(global_seconds: float) -> float:
         TRANSITION_END_SECONDS - TRANSITION_START_SECONDS
     )
     return float(smootherstep(progress))
+
+
+def preview_mixture_amount(frame_index: int, frame_count: int) -> float:
+    """Compress the full production dusk into the ten-second review clip."""
+    if frame_count < 2:
+        return 1.0
+    return float(smootherstep(frame_index / (frame_count - 1)))
 
 
 def _normalise_luminance(spd: np.ndarray) -> np.ndarray:
@@ -241,8 +248,7 @@ def render_phase4_preview(seed: int = SEED) -> dict:
     still_frames = {0, frame_count // 2, frame_count - 1}
     for frame_index in range(frame_count):
         frame_started = time.perf_counter()
-        global_seconds = CLIP_GLOBAL_START_SECONDS + frame_index / FPS
-        amount = mixture_amount(global_seconds)
+        amount = preview_mixture_amount(frame_index, frame_count)
         triangle_colours = _spectral_colours_float(spectra, mixture_spd(amount))
         frame_float = triangle_colours[id_map_1080]
         frame_8 = np.clip(
@@ -303,9 +309,10 @@ def render_phase4_preview(seed: int = SEED) -> dict:
         0, frame_count - 1, BENCHMARK_FRAME_COUNT
     ).astype(int):
         started = time.perf_counter()
-        global_seconds = CLIP_GLOBAL_START_SECONDS + int(frame_index) / FPS
         triangle_colours = _spectral_colours_float(
-            spectra, mixture_spd(mixture_amount(global_seconds))
+            spectra, mixture_spd(
+                preview_mixture_amount(int(frame_index), frame_count)
+            )
         )
         frame = np.clip(
             np.rint(triangle_colours[id_map_4k] * 255.0), 0, 255
@@ -331,16 +338,23 @@ def render_phase4_preview(seed: int = SEED) -> dict:
         "frame_count": frame_count,
         "frame_size": list(FRAME_SIZE),
         "timeline": {
-            "transition_global_seconds": [
+            "production_transition_global_seconds": [
                 TRANSITION_START_SECONDS,
                 TRANSITION_END_SECONDS,
             ],
             "ease": "smootherstep",
-            "mixture_start": mixture_amount(CLIP_GLOBAL_START_SECONDS),
-            "mixture_last_frame": mixture_amount(
-                CLIP_GLOBAL_START_SECONDS + (frame_count - 1) / FPS
+            "preview_mapping": (
+                "the full 0:40–1:50 production dusk is compressed into "
+                "the 0:40–0:50 review window"
             ),
-            "mixture_at_50_seconds": mixture_amount(50.0),
+            "production_timeline_unchanged": True,
+            "mixture_start": preview_mixture_amount(0, frame_count),
+            "mixture_midpoint": preview_mixture_amount(
+                frame_count // 2, frame_count
+            ),
+            "mixture_last_frame": preview_mixture_amount(
+                frame_count - 1, frame_count
+            ),
         },
         "illuminant": {
             "formula": "(1-m) * equal-Y D65 + m * equal-Y Illuminant A",

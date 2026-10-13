@@ -44,9 +44,9 @@ Phase 3 renders 4000×2250 supersampled PNG stills and standalone SVG panels und
 
 ## Phase 4 preview
 
-The timeboxed preview covers global film time 0:40–0:50 at 1920×1080 and 24 fps. Each frame mixes equal-luminance D65 and Illuminant A SPDs, applies the full-film smootherstep transition, and adapts from the mixture's own white using the established CAT02 degree. Because this is the first ten seconds of the specified 70-second transition, the Illuminant A mixture reaches 2.326% at 0:50.
+The timeboxed preview occupies global film time 0:40–0:50 at 1920×1080 and 24 fps. For review, it compresses the complete 0:40–1:50 production dusk into those ten seconds, moving visibly from m=0 to m=1 with the same smootherstep curve. The production film timeline remains unchanged at 70 seconds. Each frame mixes equal-luminance D65 and Illuminant A SPDs and adapts from the mixture's own white using the established CAT02 degree.
 
-Two ten-second encodes are exported: H.264 CRF 16 in `yuv420p` with channel-offset 8×8 ordered dither, and H.265 CRF 16 in `yuv420p10le` from a 16-bit RGB source. A 100% land-only midpoint crop shows no visible contour banding in either encode; the 8-bit version has slightly more fine dither/compression grain, while the 10-bit version is cleaner. Recorded mean image-generation time is 0.0703 seconds/frame at 1080p and 0.1455 seconds/frame at 4K, excluding the one-time triangle-ID raster and codec write time. Machine-readable details are in `out/film/preview_40_50/preview_report.json`.
+Two ten-second encodes are exported: H.264 CRF 16 in `yuv420p` with channel-offset 8×8 ordered dither, and H.265 CRF 16 in `yuv420p10le` from a 16-bit RGB source. A 100% land-only midpoint crop shows no visible contour banding in either encode; the 8-bit version has slightly more fine dither/compression grain, while the 10-bit version is cleaner. Recorded mean image-generation time is 0.0801 seconds/frame at 1080p and 0.1474 seconds/frame at 4K, excluding the one-time triangle-ID raster and codec write time. Machine-readable details are in `out/film/preview_40_50/preview_report.json`.
 
 ## Run Phase 1
 

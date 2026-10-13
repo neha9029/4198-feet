@@ -8,7 +8,14 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from film import A_EQUAL_Y, D65_EQUAL_Y, YBAR, mixture_amount, smootherstep
+from film import (
+    A_EQUAL_Y,
+    D65_EQUAL_Y,
+    YBAR,
+    mixture_amount,
+    preview_mixture_amount,
+    smootherstep,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +34,8 @@ def test_smootherstep_timeline_and_equal_luminance_mix() -> None:
     assert smootherstep(2.0) == 1.0
     assert mixture_amount(40.0) == 0.0
     assert np.isclose(mixture_amount(50.0), 0.02326429535276956)
+    assert preview_mixture_amount(0, 240) == 0.0
+    assert preview_mixture_amount(239, 240) == 1.0
     assert np.isclose(np.sum(D65_EQUAL_Y * YBAR), 1.0)
     assert np.isclose(np.sum(A_EQUAL_Y * YBAR), 1.0)
 
@@ -37,6 +46,9 @@ def test_phase4_preview_encodes_match_spec() -> None:
     assert result["fps"] == 24
     assert result["frame_count"] == 240
     assert result["frame_size"] == [1920, 1080]
+    assert result["timeline"]["production_timeline_unchanged"] is True
+    assert result["timeline"]["mixture_start"] == 0.0
+    assert result["timeline"]["mixture_last_frame"] == 1.0
     h264 = result["encodes"]["h264_8bit"]
     h265 = result["encodes"]["h265_10bit"]
     assert h264["crf"] == 16 and h264["probe"]["pix_fmt"] == "yuv420p"
