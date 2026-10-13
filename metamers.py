@@ -27,6 +27,7 @@ from engine import (
     spectra_to_xyz,
 )
 from mesh import MESH_PATH
+from relief import RELIEF_FACTORS_PATH
 
 
 LOW = 0.015
@@ -54,6 +55,7 @@ NORTH_HUE_ROTATION_DEGREES = 10.0
 PARALLEL_WORKERS = min(8, max(1, (os.cpu_count() or 2) - 1))
 PARALLEL_CHUNKS_PER_WORKER = 4
 SPECTRA_BASE_PATH = DATA_DIR / "phase2_base_spectra.npy"
+SPECTRA_BASE_NO_RELIEF_PATH = DATA_DIR / "phase2_base_spectra_no_relief.npy"
 SPECTRA_FINAL_PATH = DATA_DIR / "phase2_final_spectra.npy"
 REPORT_PATH = DATA_DIR.parent / "out" / "phase2" / "metamer_report.json"
 
@@ -187,10 +189,15 @@ def build_base_spectra(
     *,
     water_variant: str = RECOMMENDED_WATER_VARIANT,
     return_water_reference: bool = False,
+    relief_factors: np.ndarray | None = None,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, np.ndarray]]:
     """Assign lost water, land, and managed cells to one continuous land family."""
     del occurrence  # Class-independent land continuity is deliberate.
     land, _, _ = build_spectral_families(centroids, seed)
+    if relief_factors is not None:
+        if relief_factors.shape != (len(centroids),):
+            raise ValueError("relief_factors must have one value per triangle")
+        land = np.clip(land * relief_factors[:, None], LOW, HIGH)
     water = build_water_spectra(centroids, arms, water_variant, seed)
     spectra = land.copy()
     spectra[classes == 2] = water[classes == 2]
@@ -732,12 +739,25 @@ def solve_metamers(seed: int = SEED) -> dict:
     depths_ft = np.nan_to_num(mesh["lost_depth"], nan=0.0)
     occurrence = np.nan_to_num(mesh["occurrence"], nan=0.0)
     depth_fraction = np.clip(depths_ft / 8.4, 0.0, 1.0)
+    unrelieved_bases = build_base_spectra(
+        centroids,
+        classes,
+        arms,
+        occurrence,
+        seed,
+    )
+    relief_factors = None
+    if RELIEF_FACTORS_PATH.exists():
+        candidate = np.load(RELIEF_FACTORS_PATH)
+        if candidate.shape == (len(centroids),):
+            relief_factors = candidate
     bases = build_base_spectra(
         centroids,
         classes,
         arms,
         occurrence,
         seed,
+        relief_factors=relief_factors,
     )
     basis = _null_basis()
     lost_indices = np.flatnonzero(classes == 1)
@@ -860,6 +880,7 @@ def solve_metamers(seed: int = SEED) -> dict:
     }
 
     np.save(SPECTRA_BASE_PATH, bases)
+    np.save(SPECTRA_BASE_NO_RELIEF_PATH, unrelieved_bases)
     np.save(SPECTRA_FINAL_PATH, final)
     report = {
         "seed": seed,
@@ -873,6 +894,14 @@ def solve_metamers(seed: int = SEED) -> dict:
         "recommended_water_variant": RECOMMENDED_WATER_VARIANT,
         "water_variants_lstar": WATER_VARIANTS,
         "land_cell_variation_sigma": LAND_CELL_VARIATION_SIGMA,
+        "terrain_relief": {
+            "enabled": relief_factors is not None,
+            "factor_path": str(RELIEF_FACTORS_PATH),
+            "water_untouched": bool(
+                relief_factors is None
+                or np.all(relief_factors[classes == 2] == 1.0)
+            ),
+        },
         "parallel_solver": {
             "workers": PARALLEL_WORKERS,
             "start_method": "spawn",

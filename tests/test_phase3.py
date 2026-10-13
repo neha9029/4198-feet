@@ -46,3 +46,13 @@ def test_bear_river_bay_crops_are_native_frame_scale() -> None:
     assert Image.open(STILLS / "bear_river_bay_d65_600.png").size == (600, 600)
     assert Image.open(STILLS / "bear_river_bay_2856k_600.png").size == (600, 600)
     assert Image.open(STILLS / "bear_river_bay_crops.png").size == (1212, 600)
+
+
+def test_relief_and_unrelieved_film_frames_are_exported() -> None:
+    result = report()
+    assert result["relief_comparison_size_px"][0] == 1600
+    assert Image.open(STILLS / "4198_feet_d65_3840x2160_no_relief.png").size == (
+        3840,
+        2160,
+    )
+    assert Image.open(STILLS / "relief_comparison_1600.png").width == 1600

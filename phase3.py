@@ -14,7 +14,12 @@ from rasterio.warp import transform
 from causeway import BEAR_RIVER_BAY_WGS84
 from data import DATA_DIR, SEED
 from mesh import MESH_PATH
-from metamers import ILLUMINANT_A_K, SPECTRA_BASE_PATH, SPECTRA_FINAL_PATH
+from metamers import (
+    ILLUMINANT_A_K,
+    SPECTRA_BASE_NO_RELIEF_PATH,
+    SPECTRA_BASE_PATH,
+    SPECTRA_FINAL_PATH,
+)
 from render import render_mesh, spectral_colours
 
 
@@ -26,6 +31,8 @@ A_SVG_PATH = STILLS_DIR / "4198_feet_2856k.svg"
 DIPTYCH_PATH = STILLS_DIR / "4198_feet_diptych.png"
 D65_FRAME_PATH = STILLS_DIR / "4198_feet_d65_3840x2160.png"
 A_FRAME_PATH = STILLS_DIR / "4198_feet_2856k_3840x2160.png"
+D65_FRAME_NO_RELIEF_PATH = STILLS_DIR / "4198_feet_d65_3840x2160_no_relief.png"
+RELIEF_COMPARISON_PATH = STILLS_DIR / "relief_comparison_1600.png"
 BEAR_D65_CROP_PATH = STILLS_DIR / "bear_river_bay_d65_600.png"
 BEAR_A_CROP_PATH = STILLS_DIR / "bear_river_bay_2856k_600.png"
 BEAR_CROP_PAIR_PATH = STILLS_DIR / "bear_river_bay_crops.png"
@@ -161,6 +168,50 @@ def run_phase3(seed: int = SEED) -> dict:
     d65_size = d65.size
     del d65
 
+    relief_comparison_size = None
+    if SPECTRA_BASE_NO_RELIEF_PATH.exists():
+        no_relief = np.load(SPECTRA_BASE_NO_RELIEF_PATH)
+        no_relief_d65 = render_mesh(
+            points,
+            simplices,
+            classes,
+            spectral_colours(no_relief, "D65"),
+            raster_shape,
+            PANEL_LONG_SIDE,
+            SUPERSAMPLE,
+        )
+        no_relief_frame = no_relief_d65.resize(FRAME_SIZE, Image.Resampling.LANCZOS)
+        no_relief_frame.save(D65_FRAME_NO_RELIEF_PATH, optimize=True)
+        with Image.open(D65_FRAME_PATH) as relief_frame:
+            comparison_width = 1600
+            comparison_gap = 12
+            panel_width = (comparison_width - comparison_gap) // 2
+            panel_height = int(round(FRAME_SIZE[1] * panel_width / FRAME_SIZE[0]))
+            relief_comparison = Image.new(
+                "RGB", (comparison_width, panel_height), BACKGROUND
+            )
+            relief_comparison.paste(
+                no_relief_frame.resize(
+                    (panel_width, panel_height), Image.Resampling.LANCZOS
+                ),
+                (0, 0),
+            )
+            relief_comparison.paste(
+                relief_frame.resize(
+                    (panel_width, panel_height), Image.Resampling.LANCZOS
+                ),
+                (panel_width + comparison_gap, 0),
+            )
+        _caption(relief_comparison, "without relief", 0)
+        _caption(
+            relief_comparison,
+            "with relief · ±8%",
+            panel_width + comparison_gap,
+        )
+        relief_comparison.save(RELIEF_COMPARISON_PATH, optimize=True)
+        relief_comparison_size = list(relief_comparison.size)
+        del no_relief_d65, no_relief_frame, relief_comparison
+
     tungsten = render_mesh(
         points,
         simplices,
@@ -238,6 +289,9 @@ def run_phase3(seed: int = SEED) -> dict:
         "bear_river_bay_2856k_crop": BEAR_A_CROP_PATH,
         "bear_river_bay_crop_pair": BEAR_CROP_PAIR_PATH,
     }
+    if D65_FRAME_NO_RELIEF_PATH.exists():
+        outputs["d65_frame_without_relief"] = D65_FRAME_NO_RELIEF_PATH
+        outputs["relief_comparison_1600"] = RELIEF_COMPARISON_PATH
     report = {
         "seed": seed,
         "panel_size_px": list(d65_size),
@@ -258,6 +312,7 @@ def run_phase3(seed: int = SEED) -> dict:
         "svg_triangle_count_per_panel": int(np.count_nonzero(classes != 255)),
         "d65_identity_max_colour_channel_difference": d65_colour_max_difference,
         "d65_identity": d65_colour_max_difference == 0,
+        "relief_comparison_size_px": relief_comparison_size,
         "out_of_data_treatment": (
             "land spectral-family texture only; no metameric reveal"
         ),
