@@ -44,9 +44,11 @@ Phase 3 renders 4000×2250 supersampled PNG stills and standalone SVG panels und
 
 ## Phase 4 preview
 
-The timeboxed preview occupies global film time 0:40–0:50 at 1920×1080 and 24 fps. For review, it compresses the complete 0:40–1:50 production dusk into those ten seconds, moving visibly from m=0 to m=1 with the same smootherstep curve. The production film timeline remains unchanged at 70 seconds. Each frame mixes equal-luminance D65 and Illuminant A SPDs and adapts from the mixture's own white using the established CAT02 degree.
+The camera treats the tessellation as a flat 3D plane and projects triangle vertices afresh for every frame. It looks at the area-weighted centroid of the 4,198 ft extent. Tilt eases from 0° to 45° over 0:00–0:40, holds through 2:30, and returns to 0° at 3:20. Heading eases from 0° beginning at 0:05, approaches 90° at 3:20, and settles exactly at 90° by 3:25. Camera distance is solved per frame so the healthy extent occupies 80% of the limiting frame dimension. The opening is north-up; the final daylight state is top-down at the specified 90° heading.
 
-Two ten-second encodes are exported: H.264 CRF 16 in `yuv420p` with channel-offset 8×8 ordered dither, and H.265 CRF 16 in `yuv420p10le` from a 16-bit RGB source. A 100% land-only midpoint crop shows no visible contour banding in either encode; the 8-bit version has slightly more fine dither/compression grain, while the 10-bit version is cleaner. Recorded mean image-generation time is 0.0801 seconds/frame at 1080p and 0.1474 seconds/frame at 4K, excluding the one-time triangle-ID raster and codec write time. Machine-readable details are in `out/film/preview_40_50/preview_report.json`.
+The land plane is extended as one continuous Delaunay mesh, with source-density facets around the observed frame and a coarser far field faded into the background by radial fog. It contains no elevation extrusion. All frames use 2× geometric supersampling followed by Lanczos downsampling. Per-frame colours retain the equal-luminance D65/Illuminant A SPD mixture and CAT02 adaptation. Five sampled daylight frames compare the solved spectra against their own base spectra under the identical camera and have maximum pixel difference 0.
+
+The 0:40–0:50 shimmer clip is 1920×1080, 24 fps, H.264 CRF 16. Inspection of the moving land facets shows no persistent flicker, crawling edges, or moiré, so 2× supersampling is retained. The full 3:30 production timeline is also exported at 4× speed as a 52.5-second 1280×720 review clip. Recorded mean render times are 0.550 seconds/frame at 1080p, 0.342 seconds/frame at 720p, and 1.671 seconds/frame for the three-frame 4K benchmark. Machine-readable details are in `out/film/camera_preview_report.json`.
 
 ## Run Phase 1
 
