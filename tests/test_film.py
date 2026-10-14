@@ -1,4 +1,4 @@
-"""Phase 4 timeline, codec, timing, and banding-preview tests."""
+"""Phase 4 light, camera, identity, and preview-render tests."""
 
 from __future__ import annotations
 
@@ -10,64 +10,122 @@ from PIL import Image
 
 from film import (
     A_EQUAL_Y,
+    CAMERA_HEADING_EASE_END_SECONDS,
+    CAMERA_HEADING_END_DEGREES,
+    CAMERA_HEALTHY_FILL_FRACTION,
+    CAMERA_SUPERSAMPLE,
+    CAMERA_TILT_HOLD_DEGREES,
     D65_EQUAL_Y,
     YBAR,
+    camera_angles,
     mixture_amount,
-    preview_mixture_amount,
     smootherstep,
 )
 
 
 ROOT = Path(__file__).resolve().parents[1]
-FILM_DIR = ROOT / "out" / "film" / "preview_40_50"
-REPORT = FILM_DIR / "preview_report.json"
+FILM_DIR = ROOT / "out" / "film"
+REPORT = FILM_DIR / "camera_preview_report.json"
 
 
 def report() -> dict:
     return json.loads(REPORT.read_text(encoding="utf-8"))
 
 
-def test_smootherstep_timeline_and_equal_luminance_mix() -> None:
+def test_light_timeline_and_equal_luminance_mix() -> None:
     assert smootherstep(-1.0) == 0.0
     assert smootherstep(0.0) == 0.0
     assert smootherstep(1.0) == 1.0
     assert smootherstep(2.0) == 1.0
+    assert mixture_amount(0.0) == 0.0
     assert mixture_amount(40.0) == 0.0
-    assert np.isclose(mixture_amount(50.0), 0.02326429535276956)
-    assert preview_mixture_amount(0, 240) == 0.0
-    assert preview_mixture_amount(239, 240) == 1.0
+    assert mixture_amount(110.0) == 1.0
+    assert mixture_amount(150.0) == 1.0
+    assert mixture_amount(200.0) == 0.0
     assert np.isclose(np.sum(D65_EQUAL_Y * YBAR), 1.0)
     assert np.isclose(np.sum(A_EQUAL_Y * YBAR), 1.0)
 
 
-def test_phase4_preview_encodes_match_spec() -> None:
+def test_camera_angle_endpoints_and_holds() -> None:
+    assert camera_angles(0.0) == (0.0, 0.0)
+    tilt_40, heading_40 = camera_angles(40.0)
+    assert tilt_40 == CAMERA_TILT_HOLD_DEGREES
+    assert 0.0 < heading_40 < CAMERA_HEADING_END_DEGREES
+    assert camera_angles(150.0)[0] == CAMERA_TILT_HOLD_DEGREES
+    tilt_200, heading_200 = camera_angles(200.0)
+    assert tilt_200 == 0.0
+    assert 89.9 < heading_200 < CAMERA_HEADING_END_DEGREES
+    assert camera_angles(CAMERA_HEADING_EASE_END_SECONDS) == (
+        0.0,
+        CAMERA_HEADING_END_DEGREES,
+    )
+
+
+def test_per_frame_daylight_identity_is_exact() -> None:
     result = report()
-    assert result["duration_seconds"] == 10.0
-    assert result["fps"] == 24
-    assert result["frame_count"] == 240
-    assert result["frame_size"] == [1920, 1080]
-    assert result["timeline"]["production_timeline_unchanged"] is True
-    assert result["timeline"]["mixture_start"] == 0.0
-    assert result["timeline"]["mixture_last_frame"] == 1.0
-    h264 = result["encodes"]["h264_8bit"]
-    h265 = result["encodes"]["h265_10bit"]
-    assert h264["crf"] == 16 and h264["probe"]["pix_fmt"] == "yuv420p"
-    assert "ordered Bayer" in h264["dither"]
-    assert h265["crf"] == 16 and h265["probe"]["pix_fmt"] == "yuv420p10le"
-    for name in (
-        "4198_feet_40-50s_h264_8bit_dither.mp4",
-        "4198_feet_40-50s_h265_10bit.mp4",
+    assert result["identity_max_pixel_difference"] == 0
+    assert [row["seconds"] for row in result["identity_checks"]] == [
+        0.0,
+        20.0,
+        39.0,
+        200.0,
+        205.0,
+    ]
+    assert all(row["mixture_amount"] == 0.0 for row in result["identity_checks"])
+    assert all(
+        row["max_pixel_difference"] == 0
+        for row in result["identity_checks"]
+    )
+
+
+def test_camera_geometry_framing_and_end_states() -> None:
+    camera = report()["camera"]
+    assert camera["geometry"].startswith("flat plane")
+    assert camera["supersample"] == CAMERA_SUPERSAMPLE == 2
+    assert camera["extended_land"]["hard_edge_visible"] is False
+    assert abs(
+        camera["opening"]["healthy_fill_fraction"]
+        - CAMERA_HEALTHY_FILL_FRACTION
+    ) < 1e-6
+    assert camera["opening"]["tilt_degrees"] == 0.0
+    assert camera["opening"]["heading_degrees"] == 0.0
+    assert camera["final_daylight"]["tilt_degrees"] == 0.0
+    assert camera["final_daylight"]["heading_degrees"] == 90.0
+    assert Image.open(FILM_DIR / "camera_opening_d65_720p.png").size == (
+        1280,
+        720,
+    )
+    assert Image.open(FILM_DIR / "camera_final_daylight_720p.png").size == (
+        1280,
+        720,
+    )
+
+
+def test_shimmer_and_accelerated_preview_outputs() -> None:
+    result = report()
+    shimmer = result["shimmer_clip"]
+    assert shimmer["global_seconds"] == [40.0, 50.0]
+    assert shimmer["size"] == [1920, 1080]
+    assert shimmer["fps"] == 24
+    assert shimmer["supersample"] == 2
+    assert shimmer["visible_flicker"] is False
+    assert shimmer["visible_moire"] is False
+    assert shimmer["probe"]["nb_frames"] == "240"
+
+    fast = result["fast_preview"]
+    assert fast["speed"] == 4.0
+    assert fast["encoded_duration_seconds"] == 52.5
+    assert fast["size"] == [1280, 720]
+    assert fast["probe"]["nb_frames"] == "1260"
+    for path in (
+        FILM_DIR / "shimmer_40_50" / "4198_feet_40-50s_camera_h264.mp4",
+        FILM_DIR / "4198_feet_full_4x_720p.mp4",
     ):
-        assert (FILM_DIR / name).stat().st_size > 0
+        assert path.stat().st_size > 0
 
 
-def test_phase4_timings_and_banding_inspection() -> None:
+def test_render_timings_are_recorded() -> None:
     result = report()
-    timing = result["rendering"]
-    assert timing["mean_render_seconds_per_frame_1080p"] > 0.0
-    assert timing["mean_render_seconds_per_frame_4k"] > 0.0
-    banding = result["banding_check"]
-    assert banding["visible_h264_8bit"] is False
-    assert banding["visible_h265_10bit"] is False
-    crop = Image.open(FILM_DIR / "stills" / "banding_midpoint_land_crop.png")
-    assert crop.size == (1200, 600)
+    assert result["shimmer_clip"]["timing"]["mean_seconds_per_frame"] > 0.0
+    assert result["fast_preview"]["timing"]["mean_seconds_per_frame"] > 0.0
+    assert result["master_4k_benchmark"]["mean_seconds_per_frame"] > 0.0
