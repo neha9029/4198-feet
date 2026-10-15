@@ -11,8 +11,8 @@ import subprocess
 import time
 
 import numpy as np
-from PIL import Image, ImageDraw
-from scipy.spatial import Delaunay
+from PIL import Image, ImageDraw, ImageFont
+from scipy.ndimage import gaussian_filter
 
 from data import DATA_DIR, SEED
 from engine import (
@@ -36,6 +36,8 @@ from metamers import (
 # Film and light timing.
 FPS = 24
 FILM_DURATION_SECONDS = 210.0
+END_CARD_DURATION_SECONDS = 5.0
+TOTAL_DURATION_SECONDS = FILM_DURATION_SECONDS + END_CARD_DURATION_SECONDS
 DAYLIGHT_HOLD_END_SECONDS = 40.0
 DUSK_END_SECONDS = 110.0
 LAMPLIGHT_HOLD_END_SECONDS = 150.0
@@ -43,7 +45,7 @@ RETURN_END_SECONDS = 200.0
 FADE_START_SECONDS = 205.0
 FADE_END_SECONDS = 210.0
 
-# Camera timing and angles. Heading settles at 90° during the 3:20–3:25 hold.
+# Camera timing and angles. Heading settles at exactly 90° at 3:25.
 CAMERA_TILT_START_DEGREES = 0.0
 CAMERA_TILT_HOLD_DEGREES = 45.0
 CAMERA_TILT_IN_START_SECONDS = 0.0
@@ -60,13 +62,19 @@ CAMERA_VERTICAL_FOV_DEGREES = 36.0
 # Geometry, antialiasing, horizon, and fog.
 CAMERA_SUPERSAMPLE = 2
 EXTENDED_PLANE_HALF_SIZE = 5.0
-EXTENDED_PLANE_NEAR_MARGIN = 0.40
-EXTENDED_PLANE_NEAR_POINTS = 35_000
-EXTENDED_PLANE_FAR_POINTS = 7_000
-EXTENDED_PLANE_BOUNDARY_SAMPLES = 64
-FOG_START_RADIUS = 1.25
-FOG_END_RADIUS = 4.0
+EXTENDED_PLANE_MIN_FRUSTUM_MULTIPLE = 3.0
+FOG_START_RADIUS = 1.12
+FOG_END_RADIUS = 1.58
 BACKGROUND_RGB = np.array([244, 241, 232], dtype=np.float32) / 255.0
+
+# End card.
+END_CARD_FADE_SECONDS = 1.0
+END_CARD_TEXT_RGB = np.array([190, 190, 190], dtype=np.float32) / 255.0
+END_CARD_LINES = (
+    "4,198 Feet",
+    "Great Salt Lake, 4,189.6 ft, 9 October 2026",
+    "Neha Naik, 2026",
+)
 
 # Requested preview products.
 SHIMMER_START_SECONDS = 40.0
@@ -85,6 +93,11 @@ FAST_PREVIEW_PATH = FILM_DIR / "4198_feet_full_4x_720p.mp4"
 OPENING_STILL_PATH = FILM_DIR / "camera_opening_d65_720p.png"
 FINAL_DAYLIGHT_STILL_PATH = FILM_DIR / "camera_final_daylight_720p.png"
 REPORT_PATH = FILM_DIR / "camera_preview_report.json"
+GEOMETRY_REPORT_PATH = FILM_DIR / "camera_geometry_report.json"
+FINAL_REPORT_PATH = FILM_DIR / "final_film_report.json"
+FINAL_2160P_PATH = FILM_DIR / "4198_feet_2160p.mp4"
+FINAL_PRORES_PATH = FILM_DIR / "4198_feet_2160p_10bit.mov"
+FINAL_1080P_PATH = FILM_DIR / "4198_feet_1080p.mp4"
 
 
 @dataclass(frozen=True)
@@ -93,6 +106,8 @@ class CameraState:
     heading_degrees: float
     distance: float
     healthy_fill_fraction: float
+    screen_shift_fraction: tuple[float, float]
+    healthy_center_deviation_fraction: tuple[float, float]
 
 
 @dataclass
@@ -103,9 +118,13 @@ class FilmScene:
     healthy_points_world: np.ndarray
     final_spectra: np.ndarray
     identity_spectra: np.ndarray
-    fog: np.ndarray
+    land_spectra: np.ndarray
+    triangle_centroids_world: np.ndarray
+    tile_offsets: np.ndarray
     source_triangle_count: int
-    extension_triangle_count: int
+    tile_triangle_count: int
+    tile_width: float
+    tile_height: float
     target_normalized: np.ndarray
 
 
@@ -192,6 +211,18 @@ def fade_factor(global_seconds: float) -> float:
     )
 
 
+def end_card_opacity(global_seconds: float) -> float:
+    """Return the one-second fade-in/out envelope for the five-second card."""
+    local_seconds = global_seconds - FILM_DURATION_SECONDS
+    if local_seconds < 0.0 or local_seconds > END_CARD_DURATION_SECONDS:
+        return 0.0
+    fade_in = smootherstep(local_seconds / END_CARD_FADE_SECONDS)
+    fade_out = smootherstep(
+        (END_CARD_DURATION_SECONDS - local_seconds) / END_CARD_FADE_SECONDS
+    )
+    return float(fade_in * fade_out)
+
+
 def _normalise_luminance(spd: np.ndarray) -> np.ndarray:
     return spd / np.sum(spd * YBAR)
 
@@ -226,113 +257,8 @@ def _triangle_areas(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     return np.abs(cross) / 2.0
 
 
-def _extension_points(
-    main_points_world: np.ndarray,
-    seed: int,
-) -> np.ndarray:
-    """Sample a dense border and a fogged, coarser far field."""
-    rng = np.random.default_rng(seed + 4_198)
-    minimum = main_points_world[:, :2].min(axis=0)
-    maximum = main_points_world[:, :2].max(axis=0)
-    near_minimum = minimum - EXTENDED_PLANE_NEAR_MARGIN
-    near_maximum = maximum + EXTENDED_PLANE_NEAR_MARGIN
-    near_batches = []
-    near_count = 0
-    while near_count < EXTENDED_PLANE_NEAR_POINTS:
-        candidates = rng.uniform(
-            near_minimum,
-            near_maximum,
-            size=(EXTENDED_PLANE_NEAR_POINTS, 2),
-        )
-        outside_main = np.any(
-            (candidates < minimum) | (candidates > maximum),
-            axis=1,
-        )
-        selected = candidates[outside_main]
-        near_batches.append(selected)
-        near_count += len(selected)
-    near = np.vstack(near_batches)[:EXTENDED_PLANE_NEAR_POINTS]
-
-    far_batches = []
-    far_count = 0
-    while far_count < EXTENDED_PLANE_FAR_POINTS:
-        candidates = rng.uniform(
-            -EXTENDED_PLANE_HALF_SIZE,
-            EXTENDED_PLANE_HALF_SIZE,
-            size=(EXTENDED_PLANE_FAR_POINTS, 2),
-        )
-        outside_near = np.any(
-            (candidates < near_minimum) | (candidates > near_maximum),
-            axis=1,
-        )
-        selected = candidates[outside_near]
-        far_batches.append(selected)
-        far_count += len(selected)
-    far = np.vstack(far_batches)[:EXTENDED_PLANE_FAR_POINTS]
-
-    edge = np.linspace(
-        -EXTENDED_PLANE_HALF_SIZE,
-        EXTENDED_PLANE_HALF_SIZE,
-        EXTENDED_PLANE_BOUNDARY_SAMPLES,
-    )
-    boundary = np.vstack(
-        [
-            np.column_stack(
-                [edge, np.full_like(edge, -EXTENDED_PLANE_HALF_SIZE)]
-            ),
-            np.column_stack(
-                [edge, np.full_like(edge, EXTENDED_PLANE_HALF_SIZE)]
-            ),
-            np.column_stack(
-                [np.full_like(edge, -EXTENDED_PLANE_HALF_SIZE), edge]
-            ),
-            np.column_stack(
-                [np.full_like(edge, EXTENDED_PLANE_HALF_SIZE), edge]
-            ),
-        ]
-    )
-    points_2d = np.unique(np.vstack([near, far, boundary]), axis=0)
-    return np.column_stack(
-        [points_2d, np.zeros(len(points_2d), dtype=np.float64)]
-    )
-
-
-def _source_triangle_lookup(
-    points: np.ndarray,
-    simplices: np.ndarray,
-    sample_points: np.ndarray,
-) -> np.ndarray:
-    """Map normalized points back to the accepted source mesh triangles."""
-    width, height = 3_689, 2_075
-    canvas = Image.new("I", (width, height), 0)
-    draw = ImageDraw.Draw(canvas)
-    projected = np.rint(
-        points[simplices] * np.array([width - 1, height - 1])
-    ).astype(np.int32)
-    for triangle_index, polygon in enumerate(projected):
-        draw.polygon(
-            [tuple(vertex) for vertex in polygon],
-            fill=int(triangle_index + 1),
-        )
-    lookup = np.asarray(canvas, dtype=np.int32)
-    result = np.full(len(sample_points), -1, dtype=np.int32)
-    inside = np.all((sample_points >= 0.0) & (sample_points <= 1.0), axis=1)
-    columns = np.clip(
-        np.rint(sample_points[inside, 0] * (width - 1)),
-        0,
-        width - 1,
-    ).astype(int)
-    rows = np.clip(
-        np.rint(sample_points[inside, 1] * (height - 1)),
-        0,
-        height - 1,
-    ).astype(int)
-    result[inside] = lookup[rows, columns] - 1
-    return result
-
-
 def build_scene(seed: int = SEED) -> FilmScene:
-    """Load the production spectra and construct the flat extended plane."""
+    """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
     points = mesh["points"]
     simplices = mesh["simplices"]
@@ -356,65 +282,43 @@ def build_scene(seed: int = SEED) -> FilmScene:
     final_spectra = np.load(SPECTRA_FINAL_PATH)
     base_spectra = np.load(SPECTRA_BASE_PATH)
 
-    extension_points_world = _extension_points(points_world, seed)
-    global_points_world = np.vstack([points_world, extension_points_world])
-    global_simplices = Delaunay(global_points_world[:, :2]).simplices.astype(
-        np.int32
-    )
-    global_centroids = global_points_world[global_simplices].mean(axis=1)
-    global_centroids_normalized = np.column_stack(
-        [
-            global_centroids[:, 0] / FRAME_ASPECT_RATIO
-            + target_normalized[0],
-            target_normalized[1] - global_centroids[:, 1],
-        ]
-    )
-    mapped_old_indices = _source_triangle_lookup(
-        points,
-        simplices,
-        global_centroids_normalized,
-    )
-    mapped = mapped_old_indices >= 0
-    extension = ~mapped
-    global_classes = np.zeros(len(global_simplices), dtype=np.uint8)
-    global_classes[mapped] = classes[mapped_old_indices[mapped]]
-    global_final_spectra = np.empty(
-        (len(global_simplices), final_spectra.shape[1]),
-        dtype=final_spectra.dtype,
-    )
-    global_identity_spectra = np.empty_like(global_final_spectra)
-    global_final_spectra[mapped] = final_spectra[mapped_old_indices[mapped]]
-    global_identity_spectra[mapped] = global_final_spectra[mapped]
-    lost_mapped = mapped & (global_classes == 1)
-    global_identity_spectra[lost_mapped] = base_spectra[
-        mapped_old_indices[lost_mapped]
-    ]
-
+    identity_spectra = final_spectra.copy()
+    identity_spectra[classes == 1] = base_spectra[classes == 1]
     land_indices = np.flatnonzero(classes == 0)
     rng = np.random.default_rng(seed + 9_031)
-    exterior_spectra = base_spectra[
-        rng.choice(land_indices, size=int(np.count_nonzero(extension)), replace=True)
+    land_spectra = base_spectra[
+        rng.choice(land_indices, size=len(simplices), replace=True)
     ]
-    global_final_spectra[extension] = exterior_spectra
-    global_identity_spectra[extension] = exterior_spectra
-
-    radii = np.linalg.norm(global_centroids[:, :2], axis=1)
-    fog = smootherstep(
-        (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
-    ).astype(np.float32)
-    fog[mapped] = 0.0
-    healthy_indices = np.unique(global_simplices[np.isin(global_classes, (1, 2))].ravel())
-    healthy_points_world = global_points_world[healthy_indices]
+    triangle_centroids_world = points_world[simplices].mean(axis=1)
+    minimum = points_world[:, :2].min(axis=0)
+    maximum = points_world[:, :2].max(axis=0)
+    tile_width, tile_height = maximum - minimum
+    max_x_tiles = int(math.ceil(EXTENDED_PLANE_HALF_SIZE / tile_width)) + 1
+    max_y_tiles = int(math.ceil(EXTENDED_PLANE_HALF_SIZE / tile_height)) + 1
+    tile_offsets = np.array(
+        [
+            (ix * tile_width, iy * tile_height, 0.0)
+            for iy in range(-max_y_tiles, max_y_tiles + 1)
+            for ix in range(-max_x_tiles, max_x_tiles + 1)
+        ],
+        dtype=np.float64,
+    )
+    healthy_indices = np.unique(simplices[np.isin(classes, (1, 2))].ravel())
+    healthy_points_world = points_world[healthy_indices]
     return FilmScene(
-        points_world=global_points_world,
-        simplices=global_simplices,
-        classes=global_classes,
+        points_world=points_world,
+        simplices=simplices,
+        classes=classes,
         healthy_points_world=healthy_points_world,
-        final_spectra=global_final_spectra,
-        identity_spectra=global_identity_spectra,
-        fog=fog,
-        source_triangle_count=int(np.count_nonzero(mapped)),
-        extension_triangle_count=int(np.count_nonzero(extension)),
+        final_spectra=final_spectra,
+        identity_spectra=identity_spectra,
+        land_spectra=land_spectra,
+        triangle_centroids_world=triangle_centroids_world,
+        tile_offsets=tile_offsets,
+        source_triangle_count=len(simplices),
+        tile_triangle_count=len(tile_offsets) * len(simplices),
+        tile_width=float(tile_width),
+        tile_height=float(tile_height),
         target_normalized=target_normalized,
     )
 
@@ -442,6 +346,7 @@ def _project(
     heading_degrees: float,
     distance: float,
     size: tuple[int, int],
+    screen_shift_fraction: tuple[float, float] = (0.0, 0.0),
 ) -> tuple[np.ndarray, np.ndarray]:
     width, height = size
     right, up, forward, camera_direction = _camera_basis(
@@ -457,8 +362,8 @@ def _project(
     ndc_y = (relative @ up) * focal / safe_depth
     projected = np.column_stack(
         [
-            (ndc_x * 0.5 + 0.5) * (width - 1),
-            (0.5 - ndc_y * 0.5) * (height - 1),
+            (ndc_x * 0.5 + 0.5 + screen_shift_fraction[0]) * (width - 1),
+            (0.5 - ndc_y * 0.5 + screen_shift_fraction[1]) * (height - 1),
         ]
     )
     return projected, depth
@@ -504,11 +409,31 @@ def camera_state(
         distance,
         size,
     )
+    bbox_center = (projected.min(axis=0) + projected.max(axis=0)) / 2.0
+    frame_center = np.array([(size[0] - 1) / 2.0, (size[1] - 1) / 2.0])
+    shift = (frame_center - bbox_center) / np.array(
+        [size[0] - 1, size[1] - 1], dtype=np.float64
+    )
+    projected, _ = _project(
+        scene.healthy_points_world,
+        tilt,
+        heading,
+        distance,
+        size,
+        (float(shift[0]), float(shift[1])),
+    )
+    centered_bbox = (projected.min(axis=0) + projected.max(axis=0)) / 2.0
+    deviation = np.abs(centered_bbox - frame_center) / np.array(size)
     return CameraState(
         tilt_degrees=tilt,
         heading_degrees=heading,
         distance=distance,
         healthy_fill_fraction=_fit_metric(projected, size),
+        screen_shift_fraction=(float(shift[0]), float(shift[1])),
+        healthy_center_deviation_fraction=(
+            float(deviation[0]),
+            float(deviation[1]),
+        ),
     )
 
 
@@ -519,11 +444,15 @@ def _draw_triangle_ids(
     simplices: np.ndarray,
     size: tuple[int, int],
     id_offset: int,
+    triangle_indices: np.ndarray | None = None,
 ) -> int:
     """Draw visible projected triangles and return the visible count."""
     width, height = size
-    polygons = projected[simplices]
-    polygon_depth = depth[simplices]
+    if triangle_indices is None:
+        triangle_indices = np.arange(len(simplices), dtype=np.int32)
+    selected_simplices = simplices[triangle_indices]
+    polygons = projected[selected_simplices]
+    polygon_depth = depth[selected_simplices]
     valid = np.all(polygon_depth > 0.02, axis=1)
     minimum = polygons.min(axis=1)
     maximum = polygons.max(axis=1)
@@ -533,8 +462,9 @@ def _draw_triangle_ids(
         & (maximum[:, 1] >= 0.0)
         & (minimum[:, 1] < height)
     )
-    visible_indices = np.flatnonzero(valid)
-    rounded = np.rint(polygons[visible_indices]).astype(np.int32)
+    visible_local_indices = np.flatnonzero(valid)
+    visible_indices = triangle_indices[visible_local_indices]
+    rounded = np.rint(polygons[visible_local_indices]).astype(np.int32)
     for triangle_index, polygon in zip(visible_indices, rounded):
         draw.polygon(
             [tuple(vertex) for vertex in polygon],
@@ -551,6 +481,7 @@ def render_camera_frame(
     spectra: np.ndarray | None = None,
     supersample: int = CAMERA_SUPERSAMPLE,
     apply_fade: bool = True,
+    output_float: bool = False,
 ) -> tuple[np.ndarray, dict]:
     """Project and rasterise the true triangle geometry for one film frame."""
     started = time.perf_counter()
@@ -558,61 +489,393 @@ def render_camera_frame(
         spectra = scene.final_spectra
     camera = camera_state(scene, global_seconds, size)
     render_size = (size[0] * supersample, size[1] * supersample)
+    id_canvas = Image.new("I", render_size, 0)
+    draw = ImageDraw.Draw(id_canvas)
+    spd = mixture_spd(mixture_amount(global_seconds))
+    land_colours = _spectral_colours_float(scene.land_spectra, spd)
+    palette_blocks = [BACKGROUND_RGB[None, :]]
+    palette_offset = 1
+    visible_triangles = 0
+    visible_land_tiles = 0
+
+    # Draw repeated copies of the accepted 25k mesh as land. Only triangles
+    # that are not fully fogged need rasterisation; the conceptual plane itself
+    # continues to EXTENDED_PLANE_HALF_SIZE in every direction.
+    for tile_offset in scene.tile_offsets:
+        if np.allclose(tile_offset, 0.0):
+            continue
+        shifted_centroids = scene.triangle_centroids_world + tile_offset
+        radii = np.linalg.norm(shifted_centroids[:, :2], axis=1)
+        triangle_indices = np.flatnonzero(radii < FOG_END_RADIUS)
+        if len(triangle_indices) == 0:
+            continue
+        tile_points = scene.points_world + tile_offset
+        projected, depth = _project(
+            tile_points,
+            camera.tilt_degrees,
+            camera.heading_degrees,
+            camera.distance,
+            render_size,
+            camera.screen_shift_fraction,
+        )
+        drawn = _draw_triangle_ids(
+            draw,
+            projected,
+            depth,
+            scene.simplices,
+            render_size,
+            palette_offset,
+            triangle_indices,
+        )
+        if drawn == 0:
+            continue
+        fog = smootherstep(
+            (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
+        ).astype(np.float32)
+        tile_colours = (
+            land_colours * (1.0 - fog[:, None])
+            + BACKGROUND_RGB[None, :] * fog[:, None]
+        )
+        palette_blocks.append(tile_colours)
+        palette_offset += len(tile_colours)
+        visible_triangles += drawn
+        visible_land_tiles += 1
+
+    # The observed source tile is drawn last, over the land-only underlay.
     main_projected, main_depth = _project(
         scene.points_world,
         camera.tilt_degrees,
         camera.heading_degrees,
         camera.distance,
         render_size,
+        camera.screen_shift_fraction,
     )
-    id_canvas = Image.new("I", render_size, 0)
-    draw = ImageDraw.Draw(id_canvas)
-    triangle_offset = 1
-    visible_triangles = _draw_triangle_ids(
+    visible_triangles += _draw_triangle_ids(
         draw,
         main_projected,
         main_depth,
         scene.simplices,
         render_size,
-        triangle_offset,
+        palette_offset,
     )
-
-    spd = mixture_spd(mixture_amount(global_seconds))
     main_colours = _spectral_colours_float(spectra, spd)
-    main_colours = (
-        main_colours * (1.0 - scene.fog[:, None])
-        + BACKGROUND_RGB[None, :] * scene.fog[:, None]
-    )
-    palette = np.empty(
-        (triangle_offset + len(main_colours), 3),
-        dtype=np.float32,
-    )
-    palette[0] = BACKGROUND_RGB
-    palette[triangle_offset:] = main_colours
-    supersampled = np.clip(
-        np.rint(palette[np.asarray(id_canvas, dtype=np.int32)] * 255.0),
-        0,
-        255,
-    ).astype(np.uint8)
-    frame = np.asarray(
-        Image.fromarray(supersampled).resize(size, Image.Resampling.LANCZOS),
-        dtype=np.uint8,
-    ).copy()
+    palette_blocks.append(main_colours)
+    palette = np.vstack(palette_blocks)
+    ids = np.asarray(id_canvas, dtype=np.int32)
+    if output_float:
+        channels = []
+        for channel_index in range(3):
+            supersampled_channel = palette[:, channel_index][ids]
+            channels.append(
+                np.asarray(
+                    Image.fromarray(supersampled_channel, mode="F").resize(
+                        size,
+                        Image.Resampling.LANCZOS,
+                    ),
+                    dtype=np.float32,
+                )
+            )
+        frame = np.clip(np.stack(channels, axis=-1), 0.0, 1.0)
+    else:
+        supersampled = np.clip(
+            np.rint(palette[ids] * 255.0),
+            0,
+            255,
+        ).astype(np.uint8)
+        frame = np.asarray(
+            Image.fromarray(supersampled).resize(size, Image.Resampling.LANCZOS),
+            dtype=np.uint8,
+        ).copy()
     if apply_fade:
         fade = fade_factor(global_seconds)
         if fade < 1.0:
-            frame = np.clip(np.rint(frame.astype(np.float32) * fade), 0, 255).astype(
-                np.uint8
-            )
+            if output_float:
+                frame = frame * fade
+            else:
+                frame = np.clip(
+                    np.rint(frame.astype(np.float32) * fade), 0, 255
+                ).astype(np.uint8)
     return frame, {
         "seconds": global_seconds,
         "tilt_degrees": camera.tilt_degrees,
         "heading_degrees": camera.heading_degrees,
         "distance": camera.distance,
         "healthy_fill_fraction": camera.healthy_fill_fraction,
+        "screen_shift_fraction": list(camera.screen_shift_fraction),
+        "healthy_center_deviation_fraction": list(
+            camera.healthy_center_deviation_fraction
+        ),
         "visible_triangles": visible_triangles,
+        "visible_land_tiles": visible_land_tiles,
         "render_seconds": time.perf_counter() - started,
     }
+
+
+def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in (
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ):
+        if Path(path).exists():
+            return ImageFont.truetype(path, size=size)
+    return ImageFont.load_default()
+
+
+def render_end_card(
+    global_seconds: float,
+    size: tuple[int, int],
+    *,
+    output_float: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """Render the final black five-second title card."""
+    started = time.perf_counter()
+    scale = 2
+    render_size = (size[0] * scale, size[1] * scale)
+    opacity = end_card_opacity(global_seconds)
+    mask = Image.new("L", render_size, 0)
+    draw = ImageDraw.Draw(mask)
+    title_font = _font(max(24, int(round(size[1] * 0.026 * scale))))
+    detail_font = _font(max(18, int(round(size[1] * 0.017 * scale))))
+    fonts = (title_font, detail_font, detail_font)
+    gaps = (int(size[1] * 0.026 * scale), int(size[1] * 0.012 * scale))
+    boxes = [draw.textbbox((0, 0), line, font=font) for line, font in zip(END_CARD_LINES, fonts)]
+    heights = [box[3] - box[1] for box in boxes]
+    total_height = sum(heights) + sum(gaps)
+    y = (render_size[1] - total_height) / 2.0
+    for line_index, (line, font, box, line_height) in enumerate(
+        zip(END_CARD_LINES, fonts, boxes, heights)
+    ):
+        line_width = box[2] - box[0]
+        x = (render_size[0] - line_width) / 2.0
+        draw.text((x, y - box[1]), line, font=font, fill=255)
+        y += line_height
+        if line_index < len(gaps):
+            y += gaps[line_index]
+    downsampled = np.asarray(
+        mask.resize(size, Image.Resampling.LANCZOS), dtype=np.float32
+    ) / 255.0
+    frame_float = (
+        downsampled[:, :, None]
+        * END_CARD_TEXT_RGB[None, None, :]
+        * opacity
+    )
+    if output_float:
+        frame = frame_float.astype(np.float32)
+    else:
+        frame = np.clip(np.rint(frame_float * 255.0), 0, 255).astype(np.uint8)
+    return frame, {
+        "seconds": global_seconds,
+        "end_card": True,
+        "opacity": opacity,
+        "render_seconds": time.perf_counter() - started,
+    }
+
+
+def render_production_frame(
+    scene: FilmScene,
+    global_seconds: float,
+    size: tuple[int, int],
+    *,
+    output_float: bool = False,
+) -> tuple[np.ndarray, dict]:
+    """Render either the map film or its appended end card."""
+    if global_seconds >= FILM_DURATION_SECONDS:
+        return render_end_card(
+            global_seconds,
+            size,
+            output_float=output_float,
+        )
+    return render_camera_frame(
+        scene,
+        global_seconds,
+        size,
+        output_float=output_float,
+    )
+
+
+def _ground_frustum_corners(
+    camera: CameraState,
+    size: tuple[int, int],
+) -> np.ndarray:
+    """Intersect the four off-axis view rays with the flat z=0 plane."""
+    width, height = size
+    right, up, forward, camera_direction = _camera_basis(
+        camera.tilt_degrees,
+        camera.heading_degrees,
+    )
+    camera_position = camera_direction * camera.distance
+    tangent = math.tan(math.radians(CAMERA_VERTICAL_FOV_DEGREES) / 2.0)
+    aspect = width / height
+    result = []
+    for u, v in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
+        ndc_x = 2.0 * (u - 0.5 - camera.screen_shift_fraction[0])
+        ndc_y = 2.0 * (0.5 + camera.screen_shift_fraction[1] - v)
+        ray = forward + right * (ndc_x * aspect * tangent) + up * (ndc_y * tangent)
+        result.append(camera_position + ray * (-camera_position[2] / ray[2]))
+    return np.asarray(result)
+
+
+def _projected_triangle_area_fraction(
+    projected: np.ndarray,
+    depth: np.ndarray,
+    simplices: np.ndarray,
+    size: tuple[int, int],
+) -> float:
+    triangles = projected[simplices]
+    triangle_depth = depth[simplices]
+    valid = np.all(triangle_depth > 0.02, axis=1)
+    minimum = triangles.min(axis=1)
+    maximum = triangles.max(axis=1)
+    valid &= (
+        (maximum[:, 0] >= 0.0)
+        & (minimum[:, 0] < size[0])
+        & (maximum[:, 1] >= 0.0)
+        & (minimum[:, 1] < size[1])
+    )
+    triangles = triangles[valid]
+    if len(triangles) == 0:
+        return 0.0
+    cross = (
+        (triangles[:, 1, 0] - triangles[:, 0, 0])
+        * (triangles[:, 2, 1] - triangles[:, 0, 1])
+        - (triangles[:, 1, 1] - triangles[:, 0, 1])
+        * (triangles[:, 2, 0] - triangles[:, 0, 0])
+    )
+    return float(np.max(np.abs(cross) / 2.0) / (size[0] * size[1]))
+
+
+def camera_geometry_report(
+    scene: FilmScene | None = None,
+    *,
+    size: tuple[int, int] = (640, 360),
+    sample_interval_seconds: float = 2.0,
+) -> dict:
+    """Run the framing, horizon-density, plane-extent, and legacy gates."""
+    if scene is None:
+        scene = build_scene()
+    sample_times = np.arange(
+        0.0,
+        FILM_DURATION_SECONDS + 0.001,
+        sample_interval_seconds,
+    )
+    rows = []
+    outside_lake = ~np.isin(scene.classes, (1, 2))
+    max_triangle_fraction = 0.0
+    min_plane_multiple = float("inf")
+    max_center_deviation = 0.0
+    for seconds in sample_times:
+        camera = camera_state(scene, float(seconds), size)
+        projected, depth = _project(
+            scene.points_world,
+            camera.tilt_degrees,
+            camera.heading_degrees,
+            camera.distance,
+            size,
+            camera.screen_shift_fraction,
+        )
+        triangle_fraction = _projected_triangle_area_fraction(
+            projected,
+            depth,
+            scene.simplices[outside_lake],
+            size,
+        )
+        for tile_offset in scene.tile_offsets:
+            if np.allclose(tile_offset, 0.0):
+                continue
+            shifted_centroids = scene.triangle_centroids_world + tile_offset
+            tile_indices = np.flatnonzero(
+                np.linalg.norm(shifted_centroids[:, :2], axis=1)
+                < FOG_END_RADIUS
+            )
+            if len(tile_indices) == 0:
+                continue
+            tile_projected, tile_depth = _project(
+                scene.points_world + tile_offset,
+                camera.tilt_degrees,
+                camera.heading_degrees,
+                camera.distance,
+                size,
+                camera.screen_shift_fraction,
+            )
+            triangle_fraction = max(
+                triangle_fraction,
+                _projected_triangle_area_fraction(
+                    tile_projected,
+                    tile_depth,
+                    scene.simplices[tile_indices],
+                    size,
+                ),
+            )
+        frustum = _ground_frustum_corners(camera, size)
+        furthest_axis_extent = float(np.max(np.abs(frustum[:, :2])))
+        plane_multiple = EXTENDED_PLANE_HALF_SIZE / furthest_axis_extent
+        center_deviation = max(camera.healthy_center_deviation_fraction)
+        max_triangle_fraction = max(max_triangle_fraction, triangle_fraction)
+        min_plane_multiple = min(min_plane_multiple, plane_multiple)
+        max_center_deviation = max(max_center_deviation, center_deviation)
+        rows.append(
+            {
+                "seconds": float(seconds),
+                "tilt_degrees": camera.tilt_degrees,
+                "heading_degrees": camera.heading_degrees,
+                "center_deviation_fraction": list(
+                    camera.healthy_center_deviation_fraction
+                ),
+                "max_outside_lake_triangle_frame_fraction": triangle_fraction,
+                "plane_to_frustum_multiple": plane_multiple,
+            }
+        )
+
+    phase2_report = json.loads(
+        (DATA_DIR.parent / "out" / "phase2" / "phase2_report.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    camouflage = phase2_report["metamers"]["d65_camouflage"]
+    density = phase2_report["mesh"]["density_camouflage"]
+    report = {
+        "sample_interval_seconds": sample_interval_seconds,
+        "sample_count": len(rows),
+        "look_at": "area-weighted centroid of the 4,198 ft extent",
+        "target_normalized_xy": scene.target_normalized.tolist(),
+        "max_center_deviation_fraction": max_center_deviation,
+        "center_limit_fraction": 0.03,
+        "max_outside_lake_triangle_frame_fraction": max_triangle_fraction,
+        "triangle_area_limit_fraction": 0.005,
+        "minimum_plane_to_frustum_multiple": min_plane_multiple,
+        "required_plane_to_frustum_multiple": EXTENDED_PLANE_MIN_FRUSTUM_MULTIPLE,
+        "plane_half_size_world_units": EXTENDED_PLANE_HALF_SIZE,
+        "fog_fully_opaque_radius": FOG_END_RADIUS,
+        "fog_opaque_before_plane_edge": FOG_END_RADIUS < EXTENDED_PLANE_HALF_SIZE,
+        "final_heading_degrees": camera_angles(CAMERA_HEADING_EASE_END_SECONDS)[1],
+        "camouflage": {
+            "ks_pvalue": camouflage["ks_pvalue"],
+            "median_relative_difference": camouflage[
+                "median_relative_difference"
+            ],
+            "passes": camouflage["passes_target"],
+        },
+        "density": {
+            "relative_difference": density["relative_difference"],
+            "passes": density["passes_target"],
+        },
+        "passes": bool(
+            max_center_deviation <= 0.03
+            and max_triangle_fraction <= 0.005
+            and min_plane_multiple >= EXTENDED_PLANE_MIN_FRUSTUM_MULTIPLE
+            and FOG_END_RADIUS < EXTENDED_PLANE_HALF_SIZE
+            and camera_angles(CAMERA_HEADING_EASE_END_SECONDS)[1]
+            == CAMERA_HEADING_END_DEGREES
+            and camouflage["passes_target"]
+            and density["passes_target"]
+        ),
+        "samples": rows,
+    }
+    GEOMETRY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GEOMETRY_REPORT_PATH.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return report
 
 
 def _ffmpeg_command(path: Path, size: tuple[int, int]) -> list[str]:
@@ -711,6 +974,273 @@ def _probe(path: Path) -> dict:
         text=True,
     )
     return json.loads(payload)["streams"][0]
+
+
+_DITHER_CACHE: dict[tuple[int, int], np.ndarray] = {}
+
+
+def _blue_noise_map(size: tuple[int, int]) -> np.ndarray:
+    """Build a deterministic high-pass blue-noise-like dither map."""
+    if size in _DITHER_CACHE:
+        return _DITHER_CACHE[size]
+    rng = np.random.default_rng(SEED + 44_198)
+    white = rng.normal(size=(64, 64)).astype(np.float32)
+    high_pass = white - gaussian_filter(white, sigma=1.2, mode="wrap")
+    high_pass /= max(float(np.std(high_pass)), 1e-6)
+    tile = np.clip(high_pass / 5.0, -0.5, 0.5)
+    width, height = size
+    result = tile[np.arange(height) % 64][:, np.arange(width) % 64]
+    _DITHER_CACHE[size] = result
+    return result
+
+
+def _quantize_blue_noise(frame: np.ndarray) -> np.ndarray:
+    noise = _blue_noise_map((frame.shape[1], frame.shape[0]))
+    result = np.empty(frame.shape, dtype=np.uint8)
+    for channel in range(3):
+        channel_noise = np.roll(noise, (channel * 17, channel * 29), axis=(0, 1))
+        result[:, :, channel] = np.clip(
+            np.rint(frame[:, :, channel] * 255.0 + channel_noise),
+            0,
+            255,
+        ).astype(np.uint8)
+    return result
+
+
+def _final_h264_command(path: Path, size: tuple[int, int], crf: int) -> list[str]:
+    return [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{size[0]}x{size[1]}",
+        "-r",
+        str(FPS),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "high",
+        "-preset",
+        "medium",
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-movflags",
+        "+faststart",
+        str(path),
+    ]
+
+
+def _prores_command(path: Path, size: tuple[int, int]) -> list[str]:
+    return [
+        "ffmpeg",
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb48le",
+        "-s",
+        f"{size[0]}x{size[1]}",
+        "-r",
+        str(FPS),
+        "-i",
+        "pipe:0",
+        "-an",
+        "-c:v",
+        "prores_ks",
+        "-profile:v",
+        "3",
+        "-vendor",
+        "apl0",
+        "-pix_fmt",
+        "yuv422p10le",
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        str(path),
+    ]
+
+
+def _close_encoder(process: subprocess.Popen, label: str) -> None:
+    if process.stdin is not None:
+        process.stdin.close()
+    return_code = process.wait()
+    error = (
+        process.stderr.read().decode("utf-8", errors="replace")
+        if process.stderr
+        else ""
+    )
+    if return_code:
+        raise RuntimeError(f"{label} encoder failed with {return_code}: {error}")
+
+
+def render_final_film(seed: int = SEED) -> dict:
+    """Render the approved 4K delivery, 10-bit master, and upload copy."""
+    FILM_DIR.mkdir(parents=True, exist_ok=True)
+    scene = build_scene(seed)
+    geometry = camera_geometry_report(scene)
+    identity_checks = _identity_checks(scene)
+    identity_max = max(row["max_pixel_difference"] for row in identity_checks)
+    if not geometry["passes"] or identity_max != 0:
+        raise RuntimeError(
+            "Final render gate failed: "
+            f"geometry={geometry['passes']}, identity_max={identity_max}"
+        )
+
+    size = (3840, 2160)
+    frame_count = int(round(TOTAL_DURATION_SECONDS * FPS))
+    h264 = subprocess.Popen(
+        _final_h264_command(FINAL_2160P_PATH, size, 14),
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    prores = subprocess.Popen(
+        _prores_command(FINAL_PRORES_PATH, size),
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if h264.stdin is None or prores.stdin is None:
+        raise RuntimeError("Could not open final encoder input pipes")
+
+    rows = []
+    wall_started = time.perf_counter()
+    try:
+        for frame_index in range(frame_count):
+            global_seconds = frame_index / FPS
+            frame, metadata = render_production_frame(
+                scene,
+                global_seconds,
+                size,
+                output_float=True,
+            )
+            h264.stdin.write(_quantize_blue_noise(frame).tobytes())
+            prores_frame = np.clip(
+                np.rint(frame * 65_535.0), 0, 65_535
+            ).astype("<u2")
+            prores.stdin.write(prores_frame.tobytes())
+            rows.append(metadata)
+            if (frame_index + 1) % 12 == 0 or frame_index + 1 == frame_count:
+                elapsed = time.perf_counter() - wall_started
+                print(
+                    f"final 4K: {frame_index + 1}/{frame_count} frames "
+                    f"({elapsed:.1f}s elapsed)",
+                    flush=True,
+                )
+    except BaseException:
+        for process in (h264, prores):
+            process.kill()
+        raise
+    _close_encoder(h264, "H.264")
+    _close_encoder(prores, "ProRes")
+    master_wall_seconds = time.perf_counter() - wall_started
+
+    upload_started = time.perf_counter()
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(FINAL_2160P_PATH),
+            "-vf",
+            "scale=1920:1080:flags=lanczos",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-preset",
+            "medium",
+            "-crf",
+            "16",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(FINAL_1080P_PATH),
+        ],
+        check=True,
+    )
+    upload_wall_seconds = time.perf_counter() - upload_started
+    total_wall_seconds = time.perf_counter() - wall_started
+
+    outputs = {}
+    for label, path in (
+        ("h264_2160p", FINAL_2160P_PATH),
+        ("prores_422_hq_10bit", FINAL_PRORES_PATH),
+        ("h264_1080p", FINAL_1080P_PATH),
+    ):
+        outputs[label] = {
+            "path": str(path.relative_to(DATA_DIR.parent)),
+            "bytes": path.stat().st_size,
+            "sha256": _sha256(path),
+            "probe": _probe(path),
+        }
+    durations = [float(item["probe"]["duration"]) for item in outputs.values()]
+    report = {
+        "seed": seed,
+        "fps": FPS,
+        "frame_count": frame_count,
+        "map_film_duration_seconds": FILM_DURATION_SECONDS,
+        "end_card_duration_seconds": END_CARD_DURATION_SECONDS,
+        "total_duration_seconds": TOTAL_DURATION_SECONDS,
+        "duration_check": {
+            "expected_seconds": 215.0,
+            "actual_seconds": durations,
+            "passes": all(abs(duration - 215.0) <= 1.0 / FPS for duration in durations),
+        },
+        "final_heading_degrees": camera_angles(
+            CAMERA_HEADING_EASE_END_SECONDS
+        )[1],
+        "geometry_report": str(GEOMETRY_REPORT_PATH.relative_to(DATA_DIR.parent)),
+        "geometry_tests_pass": geometry["passes"],
+        "identity_checks": identity_checks,
+        "identity_max_pixel_difference": identity_max,
+        "end_card": {
+            "lines": list(END_CARD_LINES),
+            "fade_in_seconds": END_CARD_FADE_SECONDS,
+            "fade_out_seconds": END_CARD_FADE_SECONDS,
+        },
+        "encoding": {
+            "h264_2160p": "H.264 High, yuv420p, CRF 14, deterministic blue-noise dither",
+            "master": "ProRes 422 HQ, yuv422p10le",
+            "h264_1080p": "Lanczos downsample, H.264 High, yuv420p, CRF 16",
+        },
+        "timing": {
+            "master_render_and_encode_seconds": master_wall_seconds,
+            "upload_transcode_seconds": upload_wall_seconds,
+            "total_seconds": total_wall_seconds,
+            "frames": _summarise_timing(rows),
+        },
+        "outputs": outputs,
+    }
+    if not report["duration_check"]["passes"]:
+        raise RuntimeError(f"Final duration check failed: {durations}")
+    FINAL_REPORT_PATH.write_text(
+        json.dumps(report, indent=2) + "\n", encoding="utf-8"
+    )
+    return report
 
 
 def _sha256(path: Path) -> str:
@@ -855,9 +1385,14 @@ def render_phase4_preview(seed: int = SEED) -> dict:
                 "note": "approaches 90° by 3:20 and eases fully to rest by 3:25",
             },
             "extended_land": {
-                "total_points": int(len(scene.points_world)),
+                "source_points_per_tile": int(len(scene.points_world)),
                 "source_triangles_preserved": scene.source_triangle_count,
-                "extension_triangles": scene.extension_triangle_count,
+                "conceptual_tile_count": int(len(scene.tile_offsets)),
+                "conceptual_tile_triangles": scene.tile_triangle_count,
+                "tile_size_world_units": [
+                    scene.tile_width,
+                    scene.tile_height,
+                ],
                 "half_size_world_units": EXTENDED_PLANE_HALF_SIZE,
                 "fog_radius": [FOG_START_RADIUS, FOG_END_RADIUS],
                 "hard_edge_visible": False,

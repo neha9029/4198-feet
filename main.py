@@ -14,7 +14,7 @@ from phase2 import run_phase2
 from phase3 import run_phase3
 from mesh_density import build_density_comparison
 from relief import build_relief
-from film import render_phase4_preview
+from film import render_final_film, render_phase4_preview
 
 
 def main() -> None:
@@ -33,6 +33,7 @@ def main() -> None:
             "phase2-relief",
             "phase3",
             "phase4-preview",
+            "phase4-final",
         ),
     )
     args = parser.parse_args()
@@ -56,6 +57,8 @@ def main() -> None:
         print(json.dumps(run_phase3(), indent=2))
     elif args.phase == "phase4-preview":
         print(json.dumps(render_phase4_preview(), indent=2))
+    elif args.phase == "phase4-final":
+        print(json.dumps(render_final_film(), indent=2))
 
 
 if __name__ == "__main__":

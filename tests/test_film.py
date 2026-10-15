@@ -16,9 +16,14 @@ from film import (
     CAMERA_SUPERSAMPLE,
     CAMERA_TILT_HOLD_DEGREES,
     D65_EQUAL_Y,
+    END_CARD_LINES,
+    FILM_DURATION_SECONDS,
+    TOTAL_DURATION_SECONDS,
     YBAR,
     camera_angles,
+    end_card_opacity,
     mixture_amount,
+    render_end_card,
     smootherstep,
 )
 
@@ -26,6 +31,7 @@ from film import (
 ROOT = Path(__file__).resolve().parents[1]
 FILM_DIR = ROOT / "out" / "film"
 REPORT = FILM_DIR / "camera_preview_report.json"
+GEOMETRY_REPORT = FILM_DIR / "camera_geometry_report.json"
 
 
 def report() -> dict:
@@ -129,3 +135,37 @@ def test_render_timings_are_recorded() -> None:
     assert result["shimmer_clip"]["timing"]["mean_seconds_per_frame"] > 0.0
     assert result["fast_preview"]["timing"]["mean_seconds_per_frame"] > 0.0
     assert result["master_4k_benchmark"]["mean_seconds_per_frame"] > 0.0
+
+
+def test_geometry_gate_samples_every_two_seconds() -> None:
+    geometry = json.loads(GEOMETRY_REPORT.read_text(encoding="utf-8"))
+    assert geometry["passes"] is True
+    assert geometry["sample_interval_seconds"] == 2.0
+    assert geometry["sample_count"] == 106
+    assert geometry["max_center_deviation_fraction"] <= 0.03
+    assert geometry["max_outside_lake_triangle_frame_fraction"] <= 0.005
+    assert geometry["minimum_plane_to_frustum_multiple"] >= 3.0
+    assert geometry["fog_opaque_before_plane_edge"] is True
+    assert geometry["final_heading_degrees"] == 90.0
+    assert geometry["camouflage"]["passes"] is True
+    assert geometry["density"]["passes"] is True
+
+
+def test_end_card_timing_copy_and_fades() -> None:
+    assert TOTAL_DURATION_SECONDS == 215.0
+    assert END_CARD_LINES == (
+        "4,198 Feet",
+        "Great Salt Lake, 4,189.6 ft, 9 October 2026",
+        "Neha Naik, 2026",
+    )
+    assert end_card_opacity(FILM_DURATION_SECONDS) == 0.0
+    assert end_card_opacity(FILM_DURATION_SECONDS + 1.0) == 1.0
+    assert end_card_opacity(TOTAL_DURATION_SECONDS - 1.0) == 1.0
+    assert end_card_opacity(TOTAL_DURATION_SECONDS) == 0.0
+    middle, metadata = render_end_card(
+        FILM_DURATION_SECONDS + 2.5,
+        (640, 360),
+    )
+    assert metadata["opacity"] == 1.0
+    assert middle.shape == (360, 640, 3)
+    assert middle.max() > 0
