@@ -32,6 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FILM_DIR = ROOT / "out" / "film"
 REPORT = FILM_DIR / "camera_preview_report.json"
 GEOMETRY_REPORT = FILM_DIR / "camera_geometry_report.json"
+FINAL_REPORT = FILM_DIR / "final_film_report.json"
 
 
 def report() -> dict:
@@ -169,3 +170,29 @@ def test_end_card_timing_copy_and_fades() -> None:
     assert metadata["opacity"] == 1.0
     assert middle.shape == (360, 640, 3)
     assert middle.max() > 0
+
+
+def test_final_deliveries_are_exactly_3m35s() -> None:
+    final = json.loads(FINAL_REPORT.read_text(encoding="utf-8"))
+    assert final["frame_count"] == 5_160
+    assert final["total_duration_seconds"] == 215.0
+    assert final["duration_check"]["passes"] is True
+    assert final["identity_max_pixel_difference"] == 0
+    assert final["geometry_tests_pass"] is True
+    assert final["final_heading_degrees"] == 90.0
+    expected = {
+        "h264_2160p": (3840, 2160, "h264", "yuv420p"),
+        "prores_422_hq_10bit": (3840, 2160, "prores", "yuv422p10le"),
+        "h264_1080p": (1920, 1080, "h264", "yuv420p"),
+    }
+    for label, (width, height, codec, pixel_format) in expected.items():
+        output = final["outputs"][label]
+        probe = output["probe"]
+        assert Path(ROOT / output["path"]).stat().st_size == output["bytes"]
+        assert probe["width"] == width
+        assert probe["height"] == height
+        assert probe["codec_name"] == codec
+        assert probe["pix_fmt"] == pixel_format
+        assert probe["r_frame_rate"] == "24/1"
+        assert probe["duration"] == "215.000000"
+        assert probe["nb_frames"] == "5160"

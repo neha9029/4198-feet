@@ -52,6 +52,12 @@ All frames use 2× geometric supersampling followed by Lanczos downsampling. Per
 
 The 0:40–0:50 shimmer clip is 1920×1080, 24 fps, H.264 CRF 16. Inspection of the moving land facets shows no persistent flicker, crawling edges, or moiré, so 2× supersampling is retained. The full 3:30 production timeline is also exported at 4× speed as a 52.5-second 1280×720 review clip. Recorded mean render times are 0.550 seconds/frame at 1080p, 0.342 seconds/frame at 720p, and 1.671 seconds/frame for the three-frame 4K benchmark. Machine-readable details are in `out/film/camera_preview_report.json`.
 
+## Phase 4 final film
+
+The final 24 fps film contains 5,040 map frames followed by the 120-frame end card, for 5,160 frames and an exact duration of 3:35. The heading is at rest at exactly 90° (north points left). The every-two-second geometry gate passes: projected healthy-extent centring stays within the ±3% requirement, no rendered non-lake triangle exceeds 0.5% of frame area, the land plane extends at least 3× beyond the visible frustum, and fog is opaque before its edge. D65 identity remains at maximum pixel difference 0; the accepted camouflage and mesh-density tests also remain passing.
+
+Three deliveries are written to `out/film/`: `4198_feet_2160p.mp4` (H.264 High, yuv420p, CRF 14, deterministic blue-noise dither), `4198_feet_2160p_10bit.mov` (ProRes 422 HQ, yuv422p10le master), and `4198_feet_1080p.mp4` (upload copy). All three probe at 215.000 seconds, 24 fps, and 5,160 frames. The simultaneous 4K render/encode took 7,885.31 seconds; the 1080p transcode took 69.90 seconds; total delivery time was 7,955.21 seconds. File sizes, hashes, codec probes, and test details are recorded in `out/film/final_film_report.json`.
+
 ## Run Phase 1
 
 ```bash
