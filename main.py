@@ -36,6 +36,17 @@ def main() -> None:
             "phase4-final",
         ),
     )
+    parser.add_argument(
+        "--terrain",
+        action="store_true",
+        help="Enable opt-in 3D DEM geometry for Phase 4 renders",
+    )
+    parser.add_argument(
+        "--exaggeration",
+        type=float,
+        default=2.0,
+        help="Vertical terrain exaggeration (default: 2.0)",
+    )
     args = parser.parse_args()
     if args.phase == "phase1":
         print(json.dumps(run_phase1(), indent=2))
@@ -56,9 +67,25 @@ def main() -> None:
     elif args.phase == "phase3":
         print(json.dumps(run_phase3(), indent=2))
     elif args.phase == "phase4-preview":
-        print(json.dumps(render_phase4_preview(), indent=2))
+        print(
+            json.dumps(
+                render_phase4_preview(
+                    terrain=args.terrain,
+                    exaggeration=args.exaggeration,
+                ),
+                indent=2,
+            )
+        )
     elif args.phase == "phase4-final":
-        print(json.dumps(render_final_film(), indent=2))
+        print(
+            json.dumps(
+                render_final_film(
+                    terrain=args.terrain,
+                    exaggeration=args.exaggeration,
+                ),
+                indent=2,
+            )
+        )
 
 
 if __name__ == "__main__":

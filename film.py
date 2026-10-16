@@ -98,6 +98,10 @@ FINAL_REPORT_PATH = FILM_DIR / "final_film_report.json"
 FINAL_2160P_PATH = FILM_DIR / "4198_feet_2160p.mp4"
 FINAL_PRORES_PATH = FILM_DIR / "4198_feet_2160p_10bit.mov"
 FINAL_1080P_PATH = FILM_DIR / "4198_feet_1080p.mp4"
+TERRAIN_PREVIEW_DIR = FILM_DIR / "terrain_preview"
+TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
+TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
+TERRAIN_PREVIEW_SIZE = (1600, 900)
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,10 @@ class FilmScene:
     tile_width: float
     tile_height: float
     target_normalized: np.ndarray
+    terrain_enabled: bool
+    terrain_exaggeration: float
+    terrain_max_height_world: float
+    terrain_max_height_metres: float
 
 
 def smootherstep(value: float | np.ndarray) -> float | np.ndarray:
@@ -257,7 +265,12 @@ def _triangle_areas(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     return np.abs(cross) / 2.0
 
 
-def build_scene(seed: int = SEED) -> FilmScene:
+def build_scene(
+    seed: int = SEED,
+    *,
+    terrain: bool = False,
+    exaggeration: float = 2.0,
+) -> FilmScene:
     """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
     points = mesh["points"]
@@ -279,6 +292,20 @@ def build_scene(seed: int = SEED) -> FilmScene:
             np.zeros(len(points), dtype=np.float64),
         ]
     )
+    terrain_max_height_world = 0.0
+    terrain_max_height_metres = 0.0
+    if terrain:
+        from terrain import build_vertex_terrain
+
+        terrain_geometry = build_vertex_terrain(
+            points,
+            exaggeration=exaggeration,
+        )
+        points_world[:, 2] = terrain_geometry.heights_world
+        terrain_max_height_world = terrain_geometry.max_height_world
+        terrain_max_height_metres = (
+            terrain_geometry.max_height_metres_exaggerated
+        )
     final_spectra = np.load(SPECTRA_FINAL_PATH)
     base_spectra = np.load(SPECTRA_BASE_PATH)
 
@@ -320,6 +347,10 @@ def build_scene(seed: int = SEED) -> FilmScene:
         tile_width=float(tile_width),
         tile_height=float(tile_height),
         target_normalized=target_normalized,
+        terrain_enabled=bool(terrain),
+        terrain_exaggeration=float(exaggeration),
+        terrain_max_height_world=terrain_max_height_world,
+        terrain_max_height_metres=terrain_max_height_metres,
     )
 
 
@@ -473,6 +504,138 @@ def _draw_triangle_ids(
     return int(len(visible_indices))
 
 
+def _visible_triangle_records(
+    projected: np.ndarray,
+    depth: np.ndarray,
+    simplices: np.ndarray,
+    size: tuple[int, int],
+    id_offset: int,
+    triangle_indices: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return visible polygons, palette ids, and mean depth for 3D sorting."""
+    width, height = size
+    if triangle_indices is None:
+        triangle_indices = np.arange(len(simplices), dtype=np.int32)
+    selected_simplices = simplices[triangle_indices]
+    polygons = projected[selected_simplices]
+    polygon_depth = depth[selected_simplices]
+    valid = np.all(polygon_depth > 0.02, axis=1)
+    minimum = polygons.min(axis=1)
+    maximum = polygons.max(axis=1)
+    valid &= (
+        (maximum[:, 0] >= 0.0)
+        & (minimum[:, 0] < width)
+        & (maximum[:, 1] >= 0.0)
+        & (minimum[:, 1] < height)
+    )
+    local = np.flatnonzero(valid)
+    indices = triangle_indices[local]
+    return (
+        np.rint(polygons[local]).astype(np.int32),
+        (id_offset + indices).astype(np.int32),
+        polygon_depth[local].mean(axis=1),
+    )
+
+
+def _render_terrain_ids(
+    scene: FilmScene,
+    camera: CameraState,
+    render_size: tuple[int, int],
+    spectra: np.ndarray,
+    spd: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """Painter-rasterise all terrain tiles in one global depth order.
+
+    Film terrain is a height field without intersecting or folded facets, so a
+    global far-to-near triangle order provides correct ridge occlusion while
+    retaining the established integer-palette antialiasing path.
+    """
+    palette_blocks = [BACKGROUND_RGB[None, :]]
+    palette_offset = 1
+    polygons: list[np.ndarray] = []
+    palette_ids: list[np.ndarray] = []
+    depths: list[np.ndarray] = []
+    land_colours = _spectral_colours_float(scene.land_spectra, spd)
+    visible_land_tiles = 0
+
+    for tile_offset in scene.tile_offsets:
+        if np.allclose(tile_offset, 0.0):
+            continue
+        shifted_centroids = scene.triangle_centroids_world + tile_offset
+        radii = np.linalg.norm(shifted_centroids[:, :2], axis=1)
+        triangle_indices = np.flatnonzero(radii < FOG_END_RADIUS)
+        if len(triangle_indices) == 0:
+            continue
+        projected, depth = _project(
+            scene.points_world + tile_offset,
+            camera.tilt_degrees,
+            camera.heading_degrees,
+            camera.distance,
+            render_size,
+            camera.screen_shift_fraction,
+        )
+        tile_polygons, tile_ids, tile_depths = _visible_triangle_records(
+            projected,
+            depth,
+            scene.simplices,
+            render_size,
+            palette_offset,
+            triangle_indices,
+        )
+        if not len(tile_ids):
+            continue
+        fog = smootherstep(
+            (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
+        ).astype(np.float32)
+        palette_blocks.append(
+            land_colours * (1.0 - fog[:, None])
+            + BACKGROUND_RGB[None, :] * fog[:, None]
+        )
+        polygons.append(tile_polygons)
+        palette_ids.append(tile_ids)
+        depths.append(tile_depths)
+        palette_offset += len(land_colours)
+        visible_land_tiles += 1
+
+    main_projected, main_depth = _project(
+        scene.points_world,
+        camera.tilt_degrees,
+        camera.heading_degrees,
+        camera.distance,
+        render_size,
+        camera.screen_shift_fraction,
+    )
+    main_polygons, main_ids, main_depths = _visible_triangle_records(
+        main_projected,
+        main_depth,
+        scene.simplices,
+        render_size,
+        palette_offset,
+    )
+    palette_blocks.append(_spectral_colours_float(spectra, spd))
+    polygons.append(main_polygons)
+    palette_ids.append(main_ids)
+    depths.append(main_depths)
+
+    all_polygons = np.concatenate(polygons)
+    all_ids = np.concatenate(palette_ids)
+    all_depths = np.concatenate(depths)
+    order = np.argsort(all_depths)[::-1]
+    id_canvas = Image.new("I", render_size, 0)
+    draw = ImageDraw.Draw(id_canvas)
+    for index in order:
+        draw.polygon(
+            [tuple(vertex) for vertex in all_polygons[index]],
+            fill=int(all_ids[index]),
+        )
+    return (
+        np.asarray(id_canvas, dtype=np.int32),
+        np.vstack(palette_blocks),
+        int(len(order)),
+        visible_land_tiles,
+    )
+
+
 def render_camera_frame(
     scene: FilmScene,
     global_seconds: float,
@@ -482,6 +645,7 @@ def render_camera_frame(
     supersample: int = CAMERA_SUPERSAMPLE,
     apply_fade: bool = True,
     output_float: bool = False,
+    mixture_override: float | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Project and rasterise the true triangle geometry for one film frame."""
     started = time.perf_counter()
@@ -489,79 +653,102 @@ def render_camera_frame(
         spectra = scene.final_spectra
     camera = camera_state(scene, global_seconds, size)
     render_size = (size[0] * supersample, size[1] * supersample)
-    id_canvas = Image.new("I", render_size, 0)
-    draw = ImageDraw.Draw(id_canvas)
-    spd = mixture_spd(mixture_amount(global_seconds))
-    land_colours = _spectral_colours_float(scene.land_spectra, spd)
-    palette_blocks = [BACKGROUND_RGB[None, :]]
-    palette_offset = 1
-    visible_triangles = 0
-    visible_land_tiles = 0
+    mixture = (
+        mixture_amount(global_seconds)
+        if mixture_override is None
+        else float(mixture_override)
+    )
+    spd = mixture_spd(mixture)
+    if scene.terrain_enabled:
+        ids, palette, visible_triangles, visible_land_tiles = (
+            _render_terrain_ids(
+                scene,
+                camera,
+                render_size,
+                spectra,
+                spd,
+            )
+        )
+    else:
+        id_canvas = Image.new("I", render_size, 0)
+        draw = ImageDraw.Draw(id_canvas)
+        land_colours = _spectral_colours_float(scene.land_spectra, spd)
+        palette_blocks = [BACKGROUND_RGB[None, :]]
+        palette_offset = 1
+        visible_triangles = 0
+        visible_land_tiles = 0
 
-    # Draw repeated copies of the accepted 25k mesh as land. Only triangles
-    # that are not fully fogged need rasterisation; the conceptual plane itself
-    # continues to EXTENDED_PLANE_HALF_SIZE in every direction.
-    for tile_offset in scene.tile_offsets:
-        if np.allclose(tile_offset, 0.0):
-            continue
-        shifted_centroids = scene.triangle_centroids_world + tile_offset
-        radii = np.linalg.norm(shifted_centroids[:, :2], axis=1)
-        triangle_indices = np.flatnonzero(radii < FOG_END_RADIUS)
-        if len(triangle_indices) == 0:
-            continue
-        tile_points = scene.points_world + tile_offset
-        projected, depth = _project(
-            tile_points,
+        # Preserve the approved flat renderer exactly when terrain is off.
+        for tile_offset in scene.tile_offsets:
+            if np.allclose(tile_offset, 0.0):
+                continue
+            shifted_centroids = scene.triangle_centroids_world + tile_offset
+            radii = np.linalg.norm(shifted_centroids[:, :2], axis=1)
+            triangle_indices = np.flatnonzero(radii < FOG_END_RADIUS)
+            if len(triangle_indices) == 0:
+                continue
+            tile_points = scene.points_world + tile_offset
+            projected, depth = _project(
+                tile_points,
+                camera.tilt_degrees,
+                camera.heading_degrees,
+                camera.distance,
+                render_size,
+                camera.screen_shift_fraction,
+            )
+            drawn = _draw_triangle_ids(
+                draw,
+                projected,
+                depth,
+                scene.simplices,
+                render_size,
+                palette_offset,
+                triangle_indices,
+            )
+            if drawn == 0:
+                continue
+            fog = smootherstep(
+                (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
+            ).astype(np.float32)
+            tile_colours = (
+                land_colours * (1.0 - fog[:, None])
+                + BACKGROUND_RGB[None, :] * fog[:, None]
+            )
+            palette_blocks.append(tile_colours)
+            palette_offset += len(tile_colours)
+            visible_triangles += drawn
+            visible_land_tiles += 1
+
+        # The observed source tile is drawn last, over the land-only underlay.
+        main_projected, main_depth = _project(
+            scene.points_world,
             camera.tilt_degrees,
             camera.heading_degrees,
             camera.distance,
             render_size,
             camera.screen_shift_fraction,
         )
-        drawn = _draw_triangle_ids(
+        visible_triangles += _draw_triangle_ids(
             draw,
-            projected,
-            depth,
+            main_projected,
+            main_depth,
             scene.simplices,
             render_size,
             palette_offset,
-            triangle_indices,
         )
-        if drawn == 0:
-            continue
-        fog = smootherstep(
-            (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
-        ).astype(np.float32)
-        tile_colours = (
-            land_colours * (1.0 - fog[:, None])
-            + BACKGROUND_RGB[None, :] * fog[:, None]
-        )
-        palette_blocks.append(tile_colours)
-        palette_offset += len(tile_colours)
-        visible_triangles += drawn
-        visible_land_tiles += 1
-
-    # The observed source tile is drawn last, over the land-only underlay.
-    main_projected, main_depth = _project(
-        scene.points_world,
-        camera.tilt_degrees,
-        camera.heading_degrees,
-        camera.distance,
-        render_size,
-        camera.screen_shift_fraction,
-    )
-    visible_triangles += _draw_triangle_ids(
-        draw,
-        main_projected,
-        main_depth,
-        scene.simplices,
-        render_size,
-        palette_offset,
-    )
-    main_colours = _spectral_colours_float(spectra, spd)
-    palette_blocks.append(main_colours)
-    palette = np.vstack(palette_blocks)
-    ids = np.asarray(id_canvas, dtype=np.int32)
+        main_colours = _spectral_colours_float(spectra, spd)
+        palette_blocks.append(main_colours)
+        palette = np.vstack(palette_blocks)
+        ids = np.asarray(id_canvas, dtype=np.int32)
+    corner_background_pixels = None
+    if scene.terrain_enabled:
+        corner = min(16 * supersample, render_size[0], render_size[1])
+        corner_background_pixels = [
+            int(np.count_nonzero(ids[:corner, :corner] == 0)),
+            int(np.count_nonzero(ids[:corner, -corner:] == 0)),
+            int(np.count_nonzero(ids[-corner:, :corner] == 0)),
+            int(np.count_nonzero(ids[-corner:, -corner:] == 0)),
+        ]
     if output_float:
         channels = []
         for channel_index in range(3):
@@ -597,6 +784,7 @@ def render_camera_frame(
                 ).astype(np.uint8)
     return frame, {
         "seconds": global_seconds,
+        "mixture_amount": mixture,
         "tilt_degrees": camera.tilt_degrees,
         "heading_degrees": camera.heading_degrees,
         "distance": camera.distance,
@@ -607,6 +795,9 @@ def render_camera_frame(
         ),
         "visible_triangles": visible_triangles,
         "visible_land_tiles": visible_land_tiles,
+        "terrain_enabled": scene.terrain_enabled,
+        "terrain_exaggeration": scene.terrain_exaggeration,
+        "corner_background_pixels": corner_background_pixels,
         "render_seconds": time.perf_counter() - started,
     }
 
@@ -1094,10 +1285,19 @@ def _close_encoder(process: subprocess.Popen, label: str) -> None:
         raise RuntimeError(f"{label} encoder failed with {return_code}: {error}")
 
 
-def render_final_film(seed: int = SEED) -> dict:
+def render_final_film(
+    seed: int = SEED,
+    *,
+    terrain: bool = False,
+    exaggeration: float = 2.0,
+) -> dict:
     """Render the approved 4K delivery, 10-bit master, and upload copy."""
     FILM_DIR.mkdir(parents=True, exist_ok=True)
-    scene = build_scene(seed)
+    scene = build_scene(
+        seed,
+        terrain=terrain,
+        exaggeration=exaggeration,
+    )
     geometry = camera_geometry_report(scene)
     identity_checks = _identity_checks(scene)
     identity_max = max(row["max_pixel_difference"] for row in identity_checks)
@@ -1289,8 +1489,254 @@ def _identity_checks(scene: FilmScene) -> list[dict]:
     return checks
 
 
-def render_phase4_preview(seed: int = SEED) -> dict:
+def _terrain_identity_checks(
+    scene: FilmScene,
+    *,
+    size: tuple[int, int] = (640, 360),
+) -> list[dict]:
+    """Compare metamer and base spectra under D65 at key camera states."""
+    checks = []
+    for seconds in (0.0, 105.0, 180.0):
+        final, _ = render_camera_frame(
+            scene,
+            seconds,
+            size,
+            apply_fade=False,
+            mixture_override=0.0,
+        )
+        baseline, _ = render_camera_frame(
+            scene,
+            seconds,
+            size,
+            spectra=scene.identity_spectra,
+            apply_fade=False,
+            mixture_override=0.0,
+        )
+        checks.append(
+            {
+                "seconds": seconds,
+                "max_pixel_difference": int(
+                    np.max(
+                        np.abs(
+                            final.astype(np.int16)
+                            - baseline.astype(np.int16)
+                        )
+                    )
+                ),
+            }
+        )
+    return checks
+
+
+def _contact_sheet(
+    rows: list[tuple[float, Image.Image, Image.Image]],
+    destination: Path,
+) -> None:
+    panel_width = 800
+    panel_height = 450
+    label_height = 42
+    sheet = Image.new(
+        "RGB",
+        (panel_width * 2, len(rows) * (panel_height + label_height)),
+        (24, 24, 24),
+    )
+    draw = ImageDraw.Draw(sheet)
+    font = _font(24)
+    for row_index, (seconds, flat, terrain) in enumerate(rows):
+        y = row_index * (panel_height + label_height)
+        flat_panel = flat.resize((panel_width, panel_height), Image.Resampling.LANCZOS)
+        terrain_panel = terrain.resize(
+            (panel_width, panel_height), Image.Resampling.LANCZOS
+        )
+        sheet.paste(flat_panel, (0, y + label_height))
+        sheet.paste(terrain_panel, (panel_width, y + label_height))
+        draw.text(
+            (18, y + 8),
+            f"{int(seconds // 60)}:{int(seconds % 60):02d} · terrain off",
+            font=font,
+            fill=(220, 220, 220),
+        )
+        draw.text(
+            (panel_width + 18, y + 8),
+            f"{int(seconds // 60)}:{int(seconds % 60):02d} · terrain on",
+            font=font,
+            fill=(220, 220, 220),
+        )
+    sheet.save(destination, optimize=True)
+
+
+def render_terrain_preview(
+    seed: int = SEED,
+    *,
+    exaggeration: float = 2.0,
+) -> dict:
+    """Render the requested still-only terrain comparison; never the final film."""
+    TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    flat_scene = build_scene(seed)
+    terrain_scene = build_scene(
+        seed,
+        terrain=True,
+        exaggeration=exaggeration,
+    )
+    rows = []
+    timing = {"terrain_off_seconds": [], "terrain_on_seconds": []}
+    corners = []
+    outputs: dict[str, str] = {}
+    for seconds in TERRAIN_PREVIEW_TIMES:
+        flat, flat_metadata = render_camera_frame(
+            flat_scene,
+            seconds,
+            TERRAIN_PREVIEW_SIZE,
+            apply_fade=False,
+        )
+        terrain_frame, terrain_metadata = render_camera_frame(
+            terrain_scene,
+            seconds,
+            TERRAIN_PREVIEW_SIZE,
+            apply_fade=False,
+        )
+        stem = f"{int(seconds):03d}s"
+        flat_path = TERRAIN_PREVIEW_DIR / f"{stem}_terrain_off.png"
+        terrain_path = TERRAIN_PREVIEW_DIR / f"{stem}_terrain_on.png"
+        Image.fromarray(flat).save(flat_path, optimize=True)
+        Image.fromarray(terrain_frame).save(terrain_path, optimize=True)
+        rows.append(
+            (
+                seconds,
+                Image.fromarray(flat),
+                Image.fromarray(terrain_frame),
+            )
+        )
+        timing["terrain_off_seconds"].append(flat_metadata["render_seconds"])
+        timing["terrain_on_seconds"].append(
+            terrain_metadata["render_seconds"]
+        )
+        corners.append(
+            {
+                "seconds": seconds,
+                "background_pixels_by_corner": terrain_metadata[
+                    "corner_background_pixels"
+                ],
+            }
+        )
+        outputs[f"{stem}_terrain_off"] = str(flat_path.relative_to(DATA_DIR.parent))
+        outputs[f"{stem}_terrain_on"] = str(
+            terrain_path.relative_to(DATA_DIR.parent)
+        )
+
+    contact_path = TERRAIN_PREVIEW_DIR / "terrain_on_off_contact_sheet.png"
+    _contact_sheet(rows, contact_path)
+    outputs["contact_sheet"] = str(contact_path.relative_to(DATA_DIR.parent))
+
+    sweep_images = []
+    sweep_rows = []
+    for value in (1.0, 2.0, 3.0):
+        sweep_scene = build_scene(seed, terrain=True, exaggeration=value)
+        frame, metadata = render_camera_frame(
+            sweep_scene,
+            105.0,
+            TERRAIN_PREVIEW_SIZE,
+            apply_fade=False,
+        )
+        path = TERRAIN_PREVIEW_DIR / f"105s_exaggeration_{value:.1f}x.png"
+        Image.fromarray(frame).save(path, optimize=True)
+        sweep_images.append(Image.fromarray(frame))
+        sweep_rows.append(
+            {
+                "exaggeration": value,
+                "max_height_metres_exaggerated": (
+                    sweep_scene.terrain_max_height_metres
+                ),
+                "render_seconds": metadata["render_seconds"],
+                "path": str(path.relative_to(DATA_DIR.parent)),
+            }
+        )
+    sweep_width = 1_600
+    sweep_height = 300
+    label_height = 42
+    widths = (534, 533, 533)
+    sweep_sheet = Image.new(
+        "RGB", (sweep_width, sweep_height + label_height), (24, 24, 24)
+    )
+    sweep_draw = ImageDraw.Draw(sweep_sheet)
+    x = 0
+    for image, width, value in zip(sweep_images, widths, (1.0, 2.0, 3.0)):
+        sweep_sheet.paste(
+            image.resize((width, sweep_height), Image.Resampling.LANCZOS),
+            (x, label_height),
+        )
+        sweep_draw.text(
+            (x + 16, 8),
+            f"1:45 · relief exaggerated ×{value:.0f}",
+            font=_font(23),
+            fill=(220, 220, 220),
+        )
+        x += width
+    sweep_path = TERRAIN_PREVIEW_DIR / "105s_exaggeration_sweep.png"
+    sweep_sheet.save(sweep_path, optimize=True)
+    outputs["exaggeration_sweep"] = str(sweep_path.relative_to(DATA_DIR.parent))
+
+    identity = _terrain_identity_checks(terrain_scene)
+    flat_median = float(np.median(timing["terrain_off_seconds"]))
+    terrain_median = float(np.median(timing["terrain_on_seconds"]))
+    report = {
+        "seed": seed,
+        "preview_only": True,
+        "terrain": {
+            "enabled": True,
+            "exaggeration": exaggeration,
+            "max_vertex_height_world": terrain_scene.terrain_max_height_world,
+            "max_vertex_height_metres_exaggerated": (
+                terrain_scene.terrain_max_height_metres
+            ),
+            "shading": (
+                "existing baked 315-degree/45-degree hillshade; geometry is "
+                "unlit to avoid double-counting illumination"
+            ),
+            "occlusion": "global back-to-front sorting of all visible facets",
+        },
+        "d65_identity": {
+            "samples": identity,
+            "max_pixel_difference": max(
+                row["max_pixel_difference"] for row in identity
+            ),
+            "passes": all(
+                row["max_pixel_difference"] == 0 for row in identity
+            ),
+        },
+        "corner_check": {
+            "samples": corners,
+            "passes": all(
+                not any(row["background_pixels_by_corner"])
+                for row in corners
+            ),
+        },
+        "render_timing": {
+            "size": list(TERRAIN_PREVIEW_SIZE),
+            "terrain_off_median_seconds_per_frame": flat_median,
+            "terrain_on_median_seconds_per_frame": terrain_median,
+            "change_seconds_per_frame": terrain_median - flat_median,
+            "ratio": terrain_median / flat_median,
+        },
+        "exaggeration_sweep": sweep_rows,
+        "outputs": outputs,
+    }
+    TERRAIN_PREVIEW_REPORT_PATH.write_text(
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
+def render_phase4_preview(
+    seed: int = SEED,
+    *,
+    terrain: bool = False,
+    exaggeration: float = 2.0,
+) -> dict:
     """Render the orbit shimmer clip and the four-times-speed full-film preview."""
+    if terrain:
+        return render_terrain_preview(seed, exaggeration=exaggeration)
     FILM_DIR.mkdir(parents=True, exist_ok=True)
     SHIMMER_DIR.mkdir(parents=True, exist_ok=True)
     scene = build_scene(seed)
