@@ -7,6 +7,7 @@ import hashlib
 import numpy as np
 import pytest
 
+import film
 from data import SEED
 from film import build_scene, render_camera_frame
 from mesh import MESH_PATH
@@ -60,10 +61,53 @@ def test_terrain_d65_metamer_identity_is_exact(terrain_scene) -> None:
 def test_lakebed_vertices_and_outer_boundary_are_exactly_flat() -> None:
     mesh = np.load(MESH_PATH)
     geometry = build_vertex_terrain(mesh["points"], exaggeration=2.0)
-    assert np.all(geometry.heights_world[geometry.flat_vertex_mask] == 0.0)
+    lakebed_vertices = np.unique(
+        mesh["simplices"][np.isin(mesh["classes"], (1, 2, 3))]
+    )
+    assert np.all(geometry.flat_vertex_mask[lakebed_vertices])
+    assert np.all(geometry.heights_world[lakebed_vertices] == 0.0)
     boundary = geometry.edge_fade == 0.0
     assert np.count_nonzero(boundary) > 0
     assert np.all(geometry.heights_world[boundary] == 0.0)
+
+
+def test_source_tile_boundary_vertices_are_exactly_flat() -> None:
+    mesh = np.load(MESH_PATH)
+    geometry = build_vertex_terrain(mesh["points"], exaggeration=2.0)
+    points = mesh["points"]
+    boundary = np.any((points == 0.0) | (points == 1.0), axis=1)
+    assert np.count_nonzero(boundary) > 0
+    assert np.all(geometry.heights_world[boundary] == 0.0)
+
+
+def test_non_source_terrain_tiles_are_projected_flat(
+    monkeypatch: pytest.MonkeyPatch,
+    terrain_scene,
+) -> None:
+    original_project = film._project
+    projected_tile_count = 0
+
+    def checking_project(points_world, *args, **kwargs):
+        nonlocal projected_tile_count
+        if (
+            points_world.shape == terrain_scene.points_world.shape
+            and not np.allclose(
+                points_world[:, :2],
+                terrain_scene.points_world[:, :2],
+            )
+        ):
+            projected_tile_count += 1
+            assert np.all(points_world[:, 2] == 0.0)
+        return original_project(points_world, *args, **kwargs)
+
+    monkeypatch.setattr(film, "_project", checking_project)
+    render_camera_frame(
+        terrain_scene,
+        105.0,
+        (640, 360),
+        apply_fade=False,
+    )
+    assert projected_tile_count > 0
 
 
 def test_terrain_corners_are_covered(terrain_scene) -> None:

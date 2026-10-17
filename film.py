@@ -537,6 +537,18 @@ def _visible_triangle_records(
     )
 
 
+def _land_tile_points_world(
+    scene: FilmScene,
+    tile_offset: np.ndarray,
+) -> np.ndarray:
+    """Return a flat surrounding land tile, continuous with the source edge."""
+    tile_points = scene.points_world + tile_offset
+    if scene.terrain_enabled and not np.allclose(tile_offset, 0.0):
+        tile_points = tile_points.copy()
+        tile_points[:, 2] = 0.0
+    return tile_points
+
+
 def _render_terrain_ids(
     scene: FilmScene,
     camera: CameraState,
@@ -567,7 +579,7 @@ def _render_terrain_ids(
         if len(triangle_indices) == 0:
             continue
         projected, depth = _project(
-            scene.points_world + tile_offset,
+            _land_tile_points_world(scene, tile_offset),
             camera.tilt_degrees,
             camera.heading_degrees,
             camera.distance,
@@ -687,7 +699,7 @@ def render_camera_frame(
             triangle_indices = np.flatnonzero(radii < FOG_END_RADIUS)
             if len(triangle_indices) == 0:
                 continue
-            tile_points = scene.points_world + tile_offset
+            tile_points = _land_tile_points_world(scene, tile_offset)
             projected, depth = _project(
                 tile_points,
                 camera.tilt_degrees,
@@ -981,7 +993,7 @@ def camera_geometry_report(
             if len(tile_indices) == 0:
                 continue
             tile_projected, tile_depth = _project(
-                scene.points_world + tile_offset,
+                _land_tile_points_world(scene, tile_offset),
                 camera.tilt_degrees,
                 camera.heading_degrees,
                 camera.distance,

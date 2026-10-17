@@ -127,6 +127,12 @@ def build_vertex_terrain(
     vertex_elevation = _sample(smoothed, points, order=1).astype(np.float64)
     vertex_classes = _sample(classes, points, order=0).astype(np.uint8)
     flat_vertex_mask = np.isin(vertex_classes, (1, 2, 3))
+    mesh = np.load(MESH_PATH)
+    if len(points) != len(mesh["points"]):
+        raise ValueError("Terrain points must match the production mesh")
+    flat_triangles = np.isin(mesh["classes"], (1, 2, 3))
+    flat_triangle_vertices = np.unique(mesh["simplices"][flat_triangles])
+    flat_vertex_mask[flat_triangle_vertices] = True
 
     healthy = np.isin(classes, (1, 2))
     exterior_distance = ndimage.distance_transform_edt(~healthy) * pixel_size
