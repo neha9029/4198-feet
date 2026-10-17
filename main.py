@@ -47,6 +47,17 @@ def main() -> None:
         default=2.0,
         help="Vertical terrain exaggeration (default: 2.0)",
     )
+    parser.add_argument(
+        "--terrain-shade",
+        action="store_true",
+        help="Use experimental 3D-normal Lambert shading in Phase 4 preview",
+    )
+    parser.add_argument(
+        "--shade-strength",
+        type=float,
+        default=0.6,
+        help="Lambert terrain-shade strength in [0, 1] (default: 0.6)",
+    )
     args = parser.parse_args()
     if args.phase == "phase1":
         print(json.dumps(run_phase1(), indent=2))
@@ -72,6 +83,8 @@ def main() -> None:
                 render_phase4_preview(
                     terrain=args.terrain,
                     exaggeration=args.exaggeration,
+                    terrain_shade=args.terrain_shade,
+                    shade_strength=args.shade_strength,
                 ),
                 indent=2,
             )

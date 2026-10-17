@@ -29,8 +29,11 @@ from mesh import FRAME_ASPECT_RATIO, MESH_PATH
 from metamers import (
     ILLUMINANT_A_K,
     SPECTRA_BASE_PATH,
+    SPECTRA_BASE_NO_RELIEF_PATH,
     SPECTRA_FINAL_PATH,
 )
+from relief import RELIEF_FACTORS_PATH
+from terrain import DEFAULT_SHADE_STRENGTH
 
 
 # Film and light timing.
@@ -102,6 +105,9 @@ TERRAIN_PREVIEW_DIR = FILM_DIR / "terrain_preview"
 TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
 TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
 TERRAIN_PREVIEW_SIZE = (1600, 900)
+TERRAIN_SHADE_SWEEP = (4.0, 6.0, 8.0)
+TERRAIN_SHADE_BEST_EXAGGERATION = 4.0
+TERRAIN_SHADE_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_shade_report.json"
 
 
 @dataclass(frozen=True)
@@ -134,6 +140,10 @@ class FilmScene:
     terrain_exaggeration: float
     terrain_max_height_world: float
     terrain_max_height_metres: float
+    terrain_shade_enabled: bool
+    terrain_shade_strength: float
+    facet_shades: np.ndarray
+    baked_hillshade_enabled: bool
 
 
 def smootherstep(value: float | np.ndarray) -> float | np.ndarray:
@@ -270,6 +280,8 @@ def build_scene(
     *,
     terrain: bool = False,
     exaggeration: float = 2.0,
+    terrain_shade: bool = False,
+    shade_strength: float = DEFAULT_SHADE_STRENGTH,
 ) -> FilmScene:
     """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
@@ -294,6 +306,8 @@ def build_scene(
     )
     terrain_max_height_world = 0.0
     terrain_max_height_metres = 0.0
+    if terrain_shade and not terrain:
+        raise ValueError("Terrain shading requires terrain geometry")
     if terrain:
         from terrain import build_vertex_terrain
 
@@ -308,6 +322,30 @@ def build_scene(
         )
     final_spectra = np.load(SPECTRA_FINAL_PATH)
     base_spectra = np.load(SPECTRA_BASE_PATH)
+    baked_hillshade_enabled = True
+    if terrain_shade:
+        unrelieved_base = np.load(SPECTRA_BASE_NO_RELIEF_PATH)
+        relief_factors = np.load(RELIEF_FACTORS_PATH)
+        if relief_factors.shape != (len(simplices),):
+            raise RuntimeError("Relief factors do not match production mesh")
+        perturbation = final_spectra - base_spectra
+        final_spectra = (
+            unrelieved_base
+            + perturbation / relief_factors[:, None]
+        )
+        base_spectra = unrelieved_base
+        baked_hillshade_enabled = False
+
+    facet_shades = np.ones(len(simplices), dtype=np.float64)
+    if terrain_shade:
+        from terrain import facet_lambert_shades
+
+        facet_shades = facet_lambert_shades(
+            points_world,
+            simplices,
+            classes,
+            strength=shade_strength,
+        )
 
     identity_spectra = final_spectra.copy()
     identity_spectra[classes == 1] = base_spectra[classes == 1]
@@ -351,6 +389,10 @@ def build_scene(
         terrain_exaggeration=float(exaggeration),
         terrain_max_height_world=terrain_max_height_world,
         terrain_max_height_metres=terrain_max_height_metres,
+        terrain_shade_enabled=bool(terrain_shade),
+        terrain_shade_strength=float(shade_strength),
+        facet_shades=facet_shades,
+        baked_hillshade_enabled=baked_hillshade_enabled,
     )
 
 
@@ -624,7 +666,10 @@ def _render_terrain_ids(
         render_size,
         palette_offset,
     )
-    palette_blocks.append(_spectral_colours_float(spectra, spd))
+    main_colours = _spectral_colours_float(spectra, spd)
+    if scene.terrain_shade_enabled:
+        main_colours = main_colours * scene.facet_shades[:, None]
+    palette_blocks.append(main_colours)
     polygons.append(main_polygons)
     palette_ids.append(main_ids)
     depths.append(main_depths)
@@ -809,6 +854,8 @@ def render_camera_frame(
         "visible_land_tiles": visible_land_tiles,
         "terrain_enabled": scene.terrain_enabled,
         "terrain_exaggeration": scene.terrain_exaggeration,
+        "terrain_shade_enabled": scene.terrain_shade_enabled,
+        "terrain_shade_strength": scene.terrain_shade_strength,
         "corner_background_pixels": corner_background_pixels,
         "render_seconds": time.perf_counter() - started,
     }
@@ -1577,6 +1624,146 @@ def _contact_sheet(
     sheet.save(destination, optimize=True)
 
 
+def render_terrain_shade_preview(
+    seed: int = SEED,
+    *,
+    shade_strength: float = DEFAULT_SHADE_STRENGTH,
+) -> dict:
+    """Render only the experimental normal-shaded terrain still sweep."""
+    TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    sweep_images = []
+    sweep_rows = []
+    scenes: dict[float, FilmScene] = {}
+    for exaggeration in TERRAIN_SHADE_SWEEP:
+        scene = build_scene(
+            seed,
+            terrain=True,
+            exaggeration=exaggeration,
+            terrain_shade=True,
+            shade_strength=shade_strength,
+        )
+        scenes[exaggeration] = scene
+        frame, metadata = render_camera_frame(
+            scene,
+            105.0,
+            TERRAIN_PREVIEW_SIZE,
+            apply_fade=False,
+        )
+        path = (
+            TERRAIN_PREVIEW_DIR
+            / f"105s_terrain_shade_exaggeration_{exaggeration:.1f}x.png"
+        )
+        Image.fromarray(frame).save(path, optimize=True)
+        sweep_images.append(Image.fromarray(frame))
+        sweep_rows.append(
+            {
+                "exaggeration": exaggeration,
+                "shade_strength": shade_strength,
+                "shade_min_max": [
+                    float(scene.facet_shades.min()),
+                    float(scene.facet_shades.max()),
+                ],
+                "render_seconds": metadata["render_seconds"],
+                "path": str(path.relative_to(DATA_DIR.parent)),
+            }
+        )
+
+    contact_width = 1_600
+    image_height = 300
+    label_height = 42
+    widths = (534, 533, 533)
+    sheet = Image.new(
+        "RGB",
+        (contact_width, image_height + label_height),
+        (24, 24, 24),
+    )
+    draw = ImageDraw.Draw(sheet)
+    x = 0
+    for image, width, exaggeration in zip(
+        sweep_images,
+        widths,
+        TERRAIN_SHADE_SWEEP,
+    ):
+        sheet.paste(
+            image.resize((width, image_height), Image.Resampling.LANCZOS),
+            (x, label_height),
+        )
+        draw.text(
+            (x + 16, 8),
+            (
+                f"1:45 · ×{exaggeration:.0f} · "
+                f"normal shade s={shade_strength:.1f}"
+            ),
+            font=_font(22),
+            fill=(220, 220, 220),
+        )
+        x += width
+    contact_path = TERRAIN_PREVIEW_DIR / "shade_sweep.png"
+    sheet.save(contact_path, optimize=True)
+
+    best_scene = scenes[TERRAIN_SHADE_BEST_EXAGGERATION]
+    daylight, daylight_metadata = render_camera_frame(
+        best_scene,
+        0.0,
+        TERRAIN_PREVIEW_SIZE,
+        apply_fade=False,
+    )
+    daylight_path = (
+        TERRAIN_PREVIEW_DIR
+        / f"000s_terrain_shade_exaggeration_{TERRAIN_SHADE_BEST_EXAGGERATION:.1f}x.png"
+    )
+    Image.fromarray(daylight).save(daylight_path, optimize=True)
+
+    identity = _terrain_identity_checks(best_scene)
+    water = np.isin(best_scene.classes, (1, 2))
+    water_shades = best_scene.facet_shades[water]
+    report = {
+        "seed": seed,
+        "preview_only": True,
+        "terrain_shade": {
+            "enabled": True,
+            "shade_strength": shade_strength,
+            "sun_azimuth_degrees": 315.0,
+            "sun_altitude_degrees": 45.0,
+            "baked_hillshade_enabled": best_scene.baked_hillshade_enabled,
+            "surrounding_tiles_shade": 1.0,
+            "best_exaggeration": TERRAIN_SHADE_BEST_EXAGGERATION,
+            "water_shade_min_max": [
+                float(water_shades.min()),
+                float(water_shades.max()),
+            ],
+            "all_water_facets_exactly_one": bool(
+                np.all(water_shades == 1.0)
+            ),
+        },
+        "d65_identity": {
+            "samples": identity,
+            "max_pixel_difference": max(
+                row["max_pixel_difference"] for row in identity
+            ),
+            "passes": all(
+                row["max_pixel_difference"] == 0 for row in identity
+            ),
+        },
+        "sweep": sweep_rows,
+        "daylight": {
+            "seconds": 0.0,
+            "exaggeration": TERRAIN_SHADE_BEST_EXAGGERATION,
+            "render_seconds": daylight_metadata["render_seconds"],
+            "path": str(daylight_path.relative_to(DATA_DIR.parent)),
+        },
+        "outputs": {
+            "contact_sheet": str(contact_path.relative_to(DATA_DIR.parent)),
+            "daylight_best": str(daylight_path.relative_to(DATA_DIR.parent)),
+        },
+    }
+    TERRAIN_SHADE_REPORT_PATH.write_text(
+        json.dumps(report, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return report
+
+
 def render_terrain_preview(
     seed: int = SEED,
     *,
@@ -1745,8 +1932,17 @@ def render_phase4_preview(
     *,
     terrain: bool = False,
     exaggeration: float = 2.0,
+    terrain_shade: bool = False,
+    shade_strength: float = DEFAULT_SHADE_STRENGTH,
 ) -> dict:
     """Render the orbit shimmer clip and the four-times-speed full-film preview."""
+    if terrain_shade:
+        if not terrain:
+            raise ValueError("--terrain-shade requires --terrain")
+        return render_terrain_shade_preview(
+            seed,
+            shade_strength=shade_strength,
+        )
     if terrain:
         return render_terrain_preview(seed, exaggeration=exaggeration)
     FILM_DIR.mkdir(parents=True, exist_ok=True)

@@ -26,6 +26,17 @@ def terrain_scene():
     return build_scene(SEED, terrain=True, exaggeration=2.0)
 
 
+@pytest.fixture(scope="module")
+def shaded_terrain_scene():
+    return build_scene(
+        SEED,
+        terrain=True,
+        exaggeration=6.0,
+        terrain_shade=True,
+        shade_strength=0.6,
+    )
+
+
 def test_terrain_off_frame_hashes_match_approved_renderer() -> None:
     scene = build_scene(SEED)
     for seconds, expected in FLAT_FRAME_HASHES.items():
@@ -56,6 +67,41 @@ def test_terrain_d65_metamer_identity_is_exact(terrain_scene) -> None:
             mixture_override=0.0,
         )
         assert np.max(np.abs(final.astype(np.int16) - baseline.astype(np.int16))) == 0
+
+
+def test_shaded_terrain_d65_metamer_identity_is_exact(
+    shaded_terrain_scene,
+) -> None:
+    for seconds in (0.0, 105.0, 180.0):
+        final, _ = render_camera_frame(
+            shaded_terrain_scene,
+            seconds,
+            (640, 360),
+            apply_fade=False,
+            mixture_override=0.0,
+        )
+        baseline, _ = render_camera_frame(
+            shaded_terrain_scene,
+            seconds,
+            (640, 360),
+            spectra=shaded_terrain_scene.identity_spectra,
+            apply_fade=False,
+            mixture_override=0.0,
+        )
+        assert np.max(np.abs(final.astype(np.int16) - baseline.astype(np.int16))) == 0
+
+
+def test_shaded_water_facets_are_exactly_unshaded(
+    shaded_terrain_scene,
+) -> None:
+    assert shaded_terrain_scene.terrain_shade_enabled is True
+    assert shaded_terrain_scene.baked_hillshade_enabled is False
+    for class_value in (1, 2):
+        shades = shaded_terrain_scene.facet_shades[
+            shaded_terrain_scene.classes == class_value
+        ]
+        assert len(shades) > 0
+        assert np.all(shades == 1.0)
 
 
 def test_lakebed_vertices_and_outer_boundary_are_exactly_flat() -> None:

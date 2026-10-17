@@ -10,7 +10,12 @@ from scipy import ndimage
 
 from data import DATA_DIR
 from mesh import MESH_PATH
-from relief import DEM_PATH, SMOOTHING_METRES
+from relief import (
+    DEM_PATH,
+    SMOOTHING_METRES,
+    SUN_ALTITUDE_DEGREES,
+    SUN_AZIMUTH_DEGREES,
+)
 
 
 LAKE_LEVEL_FT = 4_198.0
@@ -19,6 +24,7 @@ DEFAULT_EXAGGERATION = 2.0
 SHORELINE_RAMP_METRES = 1_000.0
 EDGE_FADE_FRACTION = 0.08
 PIXEL_SIZE_METRES = 30.0
+DEFAULT_SHADE_STRENGTH = 0.6
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,45 @@ class TerrainGeometry:
     @property
     def max_height_metres_exaggerated(self) -> float:
         return self.max_height_world * self.frame_height_metres
+
+
+def facet_lambert_shades(
+    points_world: np.ndarray,
+    simplices: np.ndarray,
+    classes: np.ndarray,
+    *,
+    strength: float = DEFAULT_SHADE_STRENGTH,
+) -> np.ndarray:
+    """Return one source-facet Lambert scalar from the real 3D normals."""
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("Terrain shade strength must be within [0, 1]")
+    triangles = points_world[simplices]
+    normals = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    normals[normals[:, 2] < 0.0] *= -1.0
+    lengths = np.linalg.norm(normals, axis=1)
+    normals /= np.maximum(lengths[:, None], np.finfo(np.float64).eps)
+
+    azimuth = np.radians(SUN_AZIMUTH_DEGREES)
+    altitude = np.radians(SUN_ALTITUDE_DEGREES)
+    light = np.array(
+        [
+            np.cos(altitude) * np.sin(azimuth),
+            np.cos(altitude) * np.cos(azimuth),
+            np.sin(altitude),
+        ],
+        dtype=np.float64,
+    )
+    flat_dot = float(light[2])
+    lambert = np.maximum(0.0, normals @ light)
+    shades = 1.0 - strength * (1.0 - lambert / flat_dot)
+
+    flat_geometry = np.ptp(triangles[:, :, 2], axis=1) == 0.0
+    flat_water = np.isin(classes, (1, 2, 3))
+    shades[flat_geometry | flat_water] = 1.0
+    return shades.astype(np.float64)
 
 
 def _smootherstep(values: np.ndarray) -> np.ndarray:
