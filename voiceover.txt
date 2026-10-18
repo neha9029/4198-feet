@@ -1,11 +1,11 @@
-Great Salt Lake is often pictured as a fixed shape. It is not. Its shoreline moves with every foot of elevation.
+Great Salt Lake is not a fixed shape. It breathes with every foot of water. Today, at four thousand one hundred eighty-nine point six feet, so much of that water is gone.
 
-This image begins at the lake's measured level: four thousand one hundred eighty-nine point six feet, on October ninth, twenty twenty-six.
+In daylight, the loss almost disappears. What used to be lake looks like ordinary land. But the surface is holding a secret.
 
-In daylight, the missing water is hidden inside the land. The triangles use different reflectance spectra that look the same under D sixty-five daylight. As the light warms toward tungsten, those spectra separate.
+As the light warms toward tungsten, the hidden shoreline returns. Rose spreads across the north arm. Blue-green gathers across the south, through Bear River Bay and Farmington Bay.
 
-Pink marks the north arm. Blue-green marks the south. The color reveals water that would return if the lake rose to four thousand one hundred ninety-eight feet, a level associated with a healthier lake.
+This is the lake at four thousand one hundred ninety-eight feet. Not an imagined boundary, but a reconstruction from decades of Landsat water observations, calibrated to the lake's official relationship between elevation and area.
 
-The shoreline is reconstructed from Landsat water-occurrence frequency, calibrated to the lake's official elevation-area relationship. Managed evaporation ponds are excluded. The relief comes from United States Geological Survey three D elevation data, smoothed and exaggerated four times.
+Managed evaporation ponds are left outside. The surrounding mountains rise from United States Geological Survey three D elevation data, smoothed and exaggerated four times.
 
-When daylight returns, the vanished lake disappears again. The land has not moved. Only the light has changed.
+Then daylight returns, and the vanished lake disappears again. The land has not moved. Only the light has changed. But now we have seen the space the lake should occupy, and how much is at stake.
