@@ -48,6 +48,10 @@ FPS = 24
 FILM_DURATION_SECONDS = 210.0
 END_CARD_DURATION_SECONDS = 5.0
 TOTAL_DURATION_SECONDS = FILM_DURATION_SECONDS + END_CARD_DURATION_SECONDS
+TERRAIN_FINAL_MAP_DURATION_SECONDS = 85.0
+TERRAIN_FINAL_TOTAL_DURATION_SECONDS = (
+    TERRAIN_FINAL_MAP_DURATION_SECONDS + END_CARD_DURATION_SECONDS
+)
 DAYLIGHT_HOLD_END_SECONDS = 40.0
 DUSK_END_SECONDS = 110.0
 LAMPLIGHT_HOLD_END_SECONDS = 150.0
@@ -98,6 +102,7 @@ H264_CRF = 16
 MASTER_BENCHMARK_FRAME_COUNT = 3
 
 FILM_DIR = DATA_DIR.parent / "out" / "film"
+TERRAIN_FILM_DIR = DATA_DIR.parent / "out" / "film_terrain"
 SHIMMER_DIR = FILM_DIR / "shimmer_40_50"
 SHIMMER_PATH = SHIMMER_DIR / "4198_feet_40-50s_camera_h264.mp4"
 FAST_PREVIEW_PATH = FILM_DIR / "4198_feet_full_4x_720p.mp4"
@@ -109,6 +114,10 @@ FINAL_REPORT_PATH = FILM_DIR / "final_film_report.json"
 FINAL_2160P_PATH = FILM_DIR / "4198_feet_2160p.mp4"
 FINAL_PRORES_PATH = FILM_DIR / "4198_feet_2160p_10bit.mov"
 FINAL_1080P_PATH = FILM_DIR / "4198_feet_1080p.mp4"
+VOICEOVER_SCRIPT_PATH = DATA_DIR.parent / "voiceover.txt"
+VOICEOVER_VOICE = "Samantha"
+VOICEOVER_RATE = 155
+VOICEOVER_DELAY_SECONDS = 3.0
 TERRAIN_PREVIEW_DIR = FILM_DIR / "terrain_preview"
 TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
 TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
@@ -204,6 +213,19 @@ def preview_mixture_amount(frame_index: int, frame_count: int) -> float:
     return float(smootherstep(frame_index / (frame_count - 1)))
 
 
+def terrain_final_source_seconds(delivery_seconds: float) -> float:
+    """Map the brisk 85-second terrain cut onto the approved map timeline."""
+    return float(
+        np.clip(
+            delivery_seconds
+            * FILM_DURATION_SECONDS
+            / TERRAIN_FINAL_MAP_DURATION_SECONDS,
+            0.0,
+            FILM_DURATION_SECONDS,
+        )
+    )
+
+
 def camera_angles(global_seconds: float) -> tuple[float, float]:
     """Return tilt and heading in degrees for one production timestamp."""
     if global_seconds <= CAMERA_TILT_IN_END_SECONDS:
@@ -284,11 +306,10 @@ def _spectral_colours_float(spectra: np.ndarray, spd: np.ndarray) -> np.ndarray:
 
 def _triangle_areas(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     triangles = points[simplices]
-    cross = (
-        (triangles[:, 1, 0] - triangles[:, 0, 0])
-        * (triangles[:, 2, 1] - triangles[:, 0, 1])
-        - (triangles[:, 1, 1] - triangles[:, 0, 1])
-        * (triangles[:, 2, 0] - triangles[:, 0, 0])
+    cross = (triangles[:, 1, 0] - triangles[:, 0, 0]) * (
+        triangles[:, 2, 1] - triangles[:, 0, 1]
+    ) - (triangles[:, 1, 1] - triangles[:, 0, 1]) * (
+        triangles[:, 2, 0] - triangles[:, 0, 0]
     )
     return np.abs(cross) / 2.0
 
@@ -351,8 +372,7 @@ def _match_opposite_tile_edges(
 
     components: dict[int, list[int]] = {}
     boundary_indices = np.flatnonzero(
-        np.sum((triangle_points == 0.0) | (triangle_points == 1.0), axis=(1, 2))
-        >= 2
+        np.sum((triangle_points == 0.0) | (triangle_points == 1.0), axis=(1, 2)) >= 2
     )
     for index in boundary_indices:
         components.setdefault(find(int(index)), []).append(int(index))
@@ -365,14 +385,12 @@ def _match_opposite_tile_edges(
             axis=0,
         )
         match_strength = 0.20
-        source[indices] = (
-            (1.0 - match_strength) * source[indices]
-            + match_strength * component_mean
-        )
-        land[indices] = (
-            (1.0 - match_strength) * land[indices]
-            + match_strength * component_mean
-        )
+        source[indices] = (1.0 - match_strength) * source[
+            indices
+        ] + match_strength * component_mean
+        land[indices] = (1.0 - match_strength) * land[
+            indices
+        ] + match_strength * component_mean
     return source, land
 
 
@@ -411,18 +429,14 @@ def build_scene(
     if terrain and seamless_tile_edges:
         vertical = (points[:, 0] == 0.0) | (points[:, 0] == 1.0)
         horizontal = (points[:, 1] == 0.0) | (points[:, 1] == 1.0)
-        vertical_wave = (
-            0.55 * np.sin(2.0 * np.pi * (11.0 * points[:, 1] + 0.1931))
-            + 0.45 * np.sin(2.0 * np.pi * (17.0 * points[:, 1] + 0.4198))
-        )
-        horizontal_wave = (
-            0.55 * np.sin(2.0 * np.pi * (13.0 * points[:, 0] + 0.4198))
-            + 0.45 * np.sin(2.0 * np.pi * (19.0 * points[:, 0] + 0.1931))
-        )
+        vertical_wave = 0.55 * np.sin(
+            2.0 * np.pi * (11.0 * points[:, 1] + 0.1931)
+        ) + 0.45 * np.sin(2.0 * np.pi * (17.0 * points[:, 1] + 0.4198))
+        horizontal_wave = 0.55 * np.sin(
+            2.0 * np.pi * (13.0 * points[:, 0] + 0.4198)
+        ) + 0.45 * np.sin(2.0 * np.pi * (19.0 * points[:, 0] + 0.1931))
         points_world[vertical, 0] += (
-            TILE_JOIN_JITTER_FRACTION
-            * FRAME_ASPECT_RATIO
-            * vertical_wave[vertical]
+            TILE_JOIN_JITTER_FRACTION * FRAME_ASPECT_RATIO * vertical_wave[vertical]
         )
         points_world[horizontal, 1] += (
             TILE_JOIN_JITTER_FRACTION * horizontal_wave[horizontal]
@@ -445,9 +459,7 @@ def build_scene(
         )
         points_world[:, 2] = terrain_geometry.heights_world
         terrain_max_height_world = terrain_geometry.max_height_world
-        terrain_max_height_metres = (
-            terrain_geometry.max_height_metres_exaggerated
-        )
+        terrain_max_height_metres = terrain_geometry.max_height_metres_exaggerated
     final_spectra = np.load(SPECTRA_FINAL_PATH)
     base_spectra = np.load(SPECTRA_BASE_PATH)
     baked_hillshade_enabled = True
@@ -457,10 +469,7 @@ def build_scene(
         if relief_factors.shape != (len(simplices),):
             raise RuntimeError("Relief factors do not match production mesh")
         perturbation = final_spectra - base_spectra
-        final_spectra = (
-            unrelieved_base
-            + perturbation / relief_factors[:, None]
-        )
+        final_spectra = unrelieved_base + perturbation / relief_factors[:, None]
         base_spectra = unrelieved_base
         baked_hillshade_enabled = False
 
@@ -543,9 +552,7 @@ def build_scene(
         terrain_max_height_world=terrain_max_height_world,
         terrain_max_height_metres=terrain_max_height_metres,
         terrain_smoothing_metres=float(terrain_smoothing_metres),
-        terrain_radial_noise_amplitude=float(
-            terrain_radial_noise_amplitude
-        ),
+        terrain_radial_noise_amplitude=float(terrain_radial_noise_amplitude),
         terrain_shade_enabled=bool(terrain_shade),
         terrain_shade_strength=float(shade_strength),
         facet_shades=facet_shades,
@@ -563,9 +570,8 @@ def _camera_basis(
     heading = math.radians(heading_degrees)
     right = np.array([math.cos(heading), -math.sin(heading), 0.0])
     ground_up = np.array([math.sin(heading), math.cos(heading), 0.0])
-    camera_direction = (
-        -math.sin(tilt) * ground_up
-        + np.array([0.0, 0.0, math.cos(tilt)])
+    camera_direction = -math.sin(tilt) * ground_up + np.array(
+        [0.0, 0.0, math.cos(tilt)]
     )
     forward = -camera_direction
     up = np.cross(right, forward)
@@ -624,11 +630,7 @@ def camera_state(
             distance,
             size,
         )
-        metric = (
-            float("inf")
-            if np.any(depth <= 0.02)
-            else _fit_metric(projected, size)
-        )
+        metric = float("inf") if np.any(depth <= 0.02) else _fit_metric(projected, size)
         if metric > CAMERA_HEALTHY_FILL_FRACTION:
             low = distance
         else:
@@ -801,8 +803,7 @@ def _render_terrain_ids(
             (radii - FOG_START_RADIUS) / (FOG_END_RADIUS - FOG_START_RADIUS)
         ).astype(np.float32)
         palette_blocks.append(
-            land_colours * (1.0 - fog[:, None])
-            + BACKGROUND_RGB[None, :] * fog[:, None]
+            land_colours * (1.0 - fog[:, None]) + BACKGROUND_RGB[None, :] * fog[:, None]
         )
         polygons.append(tile_polygons)
         palette_ids.append(tile_ids)
@@ -876,14 +877,12 @@ def render_camera_frame(
     )
     spd = mixture_spd(mixture)
     if scene.terrain_enabled:
-        ids, palette, visible_triangles, visible_land_tiles = (
-            _render_terrain_ids(
-                scene,
-                camera,
-                render_size,
-                spectra,
-                spd,
-            )
+        ids, palette, visible_triangles, visible_land_tiles = _render_terrain_ids(
+            scene,
+            camera,
+            render_size,
+            spectra,
+            spd,
         )
     else:
         id_canvas = Image.new("I", render_size, 0)
@@ -1047,7 +1046,10 @@ def render_end_card(
     detail_font = _font(max(18, int(round(size[1] * 0.017 * scale))))
     fonts = (title_font, detail_font, detail_font)
     gaps = (int(size[1] * 0.026 * scale), int(size[1] * 0.012 * scale))
-    boxes = [draw.textbbox((0, 0), line, font=font) for line, font in zip(END_CARD_LINES, fonts)]
+    boxes = [
+        draw.textbbox((0, 0), line, font=font)
+        for line, font in zip(END_CARD_LINES, fonts)
+    ]
     heights = [box[3] - box[1] for box in boxes]
     total_height = sum(heights) + sum(gaps)
     y = (render_size[1] - total_height) / 2.0
@@ -1060,14 +1062,11 @@ def render_end_card(
         y += line_height
         if line_index < len(gaps):
             y += gaps[line_index]
-    downsampled = np.asarray(
-        mask.resize(size, Image.Resampling.LANCZOS), dtype=np.float32
-    ) / 255.0
-    frame_float = (
-        downsampled[:, :, None]
-        * END_CARD_TEXT_RGB[None, None, :]
-        * opacity
+    downsampled = (
+        np.asarray(mask.resize(size, Image.Resampling.LANCZOS), dtype=np.float32)
+        / 255.0
     )
+    frame_float = downsampled[:, :, None] * END_CARD_TEXT_RGB[None, None, :] * opacity
     if output_float:
         frame = frame_float.astype(np.float32)
     else:
@@ -1144,11 +1143,10 @@ def _projected_triangle_area_fraction(
     triangles = triangles[valid]
     if len(triangles) == 0:
         return 0.0
-    cross = (
-        (triangles[:, 1, 0] - triangles[:, 0, 0])
-        * (triangles[:, 2, 1] - triangles[:, 0, 1])
-        - (triangles[:, 1, 1] - triangles[:, 0, 1])
-        * (triangles[:, 2, 0] - triangles[:, 0, 0])
+    cross = (triangles[:, 1, 0] - triangles[:, 0, 0]) * (
+        triangles[:, 2, 1] - triangles[:, 0, 1]
+    ) - (triangles[:, 1, 1] - triangles[:, 0, 1]) * (
+        triangles[:, 2, 0] - triangles[:, 0, 0]
     )
     return float(np.max(np.abs(cross) / 2.0) / (size[0] * size[1]))
 
@@ -1158,6 +1156,7 @@ def camera_geometry_report(
     *,
     size: tuple[int, int] = (640, 360),
     sample_interval_seconds: float = 2.0,
+    report_path: Path = GEOMETRY_REPORT_PATH,
 ) -> dict:
     """Run the framing, horizon-density, plane-extent, and legacy gates."""
     if scene is None:
@@ -1193,8 +1192,7 @@ def camera_geometry_report(
                 continue
             shifted_centroids = scene.triangle_centroids_world + tile_offset
             tile_indices = np.flatnonzero(
-                np.linalg.norm(shifted_centroids[:, :2], axis=1)
-                < FOG_END_RADIUS
+                np.linalg.norm(shifted_centroids[:, :2], axis=1) < FOG_END_RADIUS
             )
             if len(tile_indices) == 0:
                 continue
@@ -1259,9 +1257,7 @@ def camera_geometry_report(
         "final_heading_degrees": camera_angles(CAMERA_HEADING_EASE_END_SECONDS)[1],
         "camouflage": {
             "ks_pvalue": camouflage["ks_pvalue"],
-            "median_relative_difference": camouflage[
-                "median_relative_difference"
-            ],
+            "median_relative_difference": camouflage["median_relative_difference"],
             "passes": camouflage["passes_target"],
         },
         "density": {
@@ -1280,10 +1276,8 @@ def camera_geometry_report(
         ),
         "samples": rows,
     }
-    GEOMETRY_REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    GEOMETRY_REPORT_PATH.write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 
@@ -1385,6 +1379,26 @@ def _probe(path: Path) -> dict:
     return json.loads(payload)["streams"][0]
 
 
+def _probe_audio(path: Path) -> dict | None:
+    payload = subprocess.check_output(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_name,sample_rate,channels,channel_layout,duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        text=True,
+    )
+    streams = json.loads(payload)["streams"]
+    return streams[0] if streams else None
+
+
 _DITHER_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 
@@ -1416,8 +1430,15 @@ def _quantize_blue_noise(frame: np.ndarray) -> np.ndarray:
     return result
 
 
-def _final_h264_command(path: Path, size: tuple[int, int], crf: int) -> list[str]:
-    return [
+def _final_h264_command(
+    path: Path,
+    size: tuple[int, int],
+    crf: int,
+    *,
+    audio_path: Path | None = None,
+    duration_seconds: float | None = None,
+) -> list[str]:
+    command = [
         "ffmpeg",
         "-y",
         "-loglevel",
@@ -1432,31 +1453,63 @@ def _final_h264_command(path: Path, size: tuple[int, int], crf: int) -> list[str
         str(FPS),
         "-i",
         "pipe:0",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-profile:v",
-        "high",
-        "-preset",
-        "medium",
-        "-crf",
-        str(crf),
-        "-pix_fmt",
-        "yuv420p",
-        "-color_primaries",
-        "bt709",
-        "-color_trc",
-        "bt709",
-        "-colorspace",
-        "bt709",
-        "-movflags",
-        "+faststart",
-        str(path),
     ]
+    if audio_path is not None:
+        command.extend(
+            [
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-af",
+                (
+                    f"adelay={int(round(VOICEOVER_DELAY_SECONDS * 1000))}:all=1,"
+                    f"apad=whole_dur={duration_seconds:.6f}"
+                ),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+            ]
+        )
+    else:
+        command.append("-an")
+    command.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "high",
+            "-preset",
+            "medium",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            "-movflags",
+            "+faststart",
+            str(path),
+        ]
+    )
+    return command
 
 
-def _prores_command(path: Path, size: tuple[int, int]) -> list[str]:
-    return [
+def _prores_command(
+    path: Path,
+    size: tuple[int, int],
+    *,
+    audio_path: Path | None = None,
+    duration_seconds: float | None = None,
+) -> list[str]:
+    command = [
         "ffmpeg",
         "-y",
         "-loglevel",
@@ -1471,23 +1524,47 @@ def _prores_command(path: Path, size: tuple[int, int]) -> list[str]:
         str(FPS),
         "-i",
         "pipe:0",
-        "-an",
-        "-c:v",
-        "prores_ks",
-        "-profile:v",
-        "3",
-        "-vendor",
-        "apl0",
-        "-pix_fmt",
-        "yuv422p10le",
-        "-color_primaries",
-        "bt709",
-        "-color_trc",
-        "bt709",
-        "-colorspace",
-        "bt709",
-        str(path),
     ]
+    if audio_path is not None:
+        command.extend(
+            [
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-af",
+                (
+                    f"adelay={int(round(VOICEOVER_DELAY_SECONDS * 1000))}:all=1,"
+                    f"apad=whole_dur={duration_seconds:.6f}"
+                ),
+                "-c:a",
+                "pcm_s24le",
+            ]
+        )
+    else:
+        command.append("-an")
+    command.extend(
+        [
+            "-c:v",
+            "prores_ks",
+            "-profile:v",
+            "3",
+            "-vendor",
+            "apl0",
+            "-pix_fmt",
+            "yuv422p10le",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+            str(path),
+        ]
+    )
+    return command
 
 
 def _close_encoder(process: subprocess.Popen, label: str) -> None:
@@ -1508,15 +1585,45 @@ def render_final_film(
     *,
     terrain: bool = False,
     exaggeration: float = DEFAULT_EXAGGERATION,
+    terrain_shade: bool | None = None,
+    shade_strength: float = DEFAULT_SHADE_STRENGTH,
+    terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> dict:
     """Render the approved 4K delivery, 10-bit master, and upload copy."""
-    FILM_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = TERRAIN_FILM_DIR if terrain else FILM_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final_2160p_path = output_dir / "4198_feet_2160p.mp4"
+    final_prores_path = output_dir / "4198_feet_2160p_10bit.mov"
+    final_1080p_path = output_dir / "4198_feet_1080p.mp4"
+    final_report_path = output_dir / "final_film_report.json"
+    geometry_report_path = output_dir / "camera_geometry_report.json"
+    voiceover_path: Path | None = output_dir / "4198_feet_voiceover.aiff"
+    if terrain:
+        subprocess.run(
+            [
+                "say",
+                "-v",
+                VOICEOVER_VOICE,
+                "-r",
+                str(VOICEOVER_RATE),
+                "-o",
+                str(voiceover_path),
+                "-f",
+                str(VOICEOVER_SCRIPT_PATH),
+            ],
+            check=True,
+        )
+    else:
+        voiceover_path = None
     scene = build_scene(
         seed,
         terrain=terrain,
         exaggeration=exaggeration,
+        terrain_shade=terrain_shade,
+        shade_strength=shade_strength,
+        terrain_smoothing_metres=terrain_smoothing_metres,
     )
-    geometry = camera_geometry_report(scene)
+    geometry = camera_geometry_report(scene, report_path=geometry_report_path)
     identity_checks = _identity_checks(scene)
     identity_max = max(row["max_pixel_difference"] for row in identity_checks)
     if not geometry["passes"] or identity_max != 0:
@@ -1526,14 +1633,31 @@ def render_final_film(
         )
 
     size = (3840, 2160)
-    frame_count = int(round(TOTAL_DURATION_SECONDS * FPS))
+    map_duration_seconds = (
+        TERRAIN_FINAL_MAP_DURATION_SECONDS if terrain else FILM_DURATION_SECONDS
+    )
+    total_duration_seconds = (
+        TERRAIN_FINAL_TOTAL_DURATION_SECONDS if terrain else TOTAL_DURATION_SECONDS
+    )
+    frame_count = int(round(total_duration_seconds * FPS))
     h264 = subprocess.Popen(
-        _final_h264_command(FINAL_2160P_PATH, size, 14),
+        _final_h264_command(
+            final_2160p_path,
+            size,
+            14,
+            audio_path=voiceover_path,
+            duration_seconds=total_duration_seconds,
+        ),
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     prores = subprocess.Popen(
-        _prores_command(FINAL_PRORES_PATH, size),
+        _prores_command(
+            final_prores_path,
+            size,
+            audio_path=voiceover_path,
+            duration_seconds=total_duration_seconds,
+        ),
         stdin=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -1544,17 +1668,32 @@ def render_final_film(
     wall_started = time.perf_counter()
     try:
         for frame_index in range(frame_count):
-            global_seconds = frame_index / FPS
-            frame, metadata = render_production_frame(
-                scene,
-                global_seconds,
-                size,
-                output_float=True,
-            )
+            delivery_seconds = frame_index / FPS
+            if terrain and delivery_seconds >= map_duration_seconds:
+                source_seconds = FILM_DURATION_SECONDS + (
+                    delivery_seconds - map_duration_seconds
+                )
+                frame, metadata = render_end_card(
+                    source_seconds,
+                    size,
+                    output_float=True,
+                )
+            else:
+                source_seconds = (
+                    terrain_final_source_seconds(delivery_seconds)
+                    if terrain
+                    else delivery_seconds
+                )
+                frame, metadata = render_production_frame(
+                    scene,
+                    source_seconds,
+                    size,
+                    output_float=True,
+                )
+            metadata["delivery_seconds"] = delivery_seconds
+            metadata["source_seconds"] = source_seconds
             h264.stdin.write(_quantize_blue_noise(frame).tobytes())
-            prores_frame = np.clip(
-                np.rint(frame * 65_535.0), 0, 65_535
-            ).astype("<u2")
+            prores_frame = np.clip(np.rint(frame * 65_535.0), 0, 65_535).astype("<u2")
             prores.stdin.write(prores_frame.tobytes())
             rows.append(metadata)
             if (frame_index + 1) % 12 == 0 or frame_index + 1 == frame_count:
@@ -1580,10 +1719,13 @@ def render_final_film(
             "-loglevel",
             "error",
             "-i",
-            str(FINAL_2160P_PATH),
+            str(final_2160p_path),
             "-vf",
             "scale=1920:1080:flags=lanczos",
-            "-an",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
             "-c:v",
             "libx264",
             "-profile:v",
@@ -1594,9 +1736,11 @@ def render_final_film(
             "16",
             "-pix_fmt",
             "yuv420p",
+            "-c:a",
+            "copy",
             "-movflags",
             "+faststart",
-            str(FINAL_1080P_PATH),
+            str(final_1080p_path),
         ],
         check=True,
     )
@@ -1605,33 +1749,55 @@ def render_final_film(
 
     outputs = {}
     for label, path in (
-        ("h264_2160p", FINAL_2160P_PATH),
-        ("prores_422_hq_10bit", FINAL_PRORES_PATH),
-        ("h264_1080p", FINAL_1080P_PATH),
+        ("h264_2160p", final_2160p_path),
+        ("prores_422_hq_10bit", final_prores_path),
+        ("h264_1080p", final_1080p_path),
     ):
         outputs[label] = {
             "path": str(path.relative_to(DATA_DIR.parent)),
             "bytes": path.stat().st_size,
             "sha256": _sha256(path),
             "probe": _probe(path),
+            "audio_probe": _probe_audio(path),
         }
     durations = [float(item["probe"]["duration"]) for item in outputs.values()]
     report = {
         "seed": seed,
         "fps": FPS,
         "frame_count": frame_count,
-        "map_film_duration_seconds": FILM_DURATION_SECONDS,
+        "map_film_duration_seconds": map_duration_seconds,
         "end_card_duration_seconds": END_CARD_DURATION_SECONDS,
-        "total_duration_seconds": TOTAL_DURATION_SECONDS,
+        "total_duration_seconds": total_duration_seconds,
         "duration_check": {
-            "expected_seconds": 215.0,
+            "expected_seconds": total_duration_seconds,
             "actual_seconds": durations,
-            "passes": all(abs(duration - 215.0) <= 1.0 / FPS for duration in durations),
+            "passes": all(
+                abs(duration - total_duration_seconds) <= 1.0 / FPS
+                for duration in durations
+            ),
         },
-        "final_heading_degrees": camera_angles(
-            CAMERA_HEADING_EASE_END_SECONDS
-        )[1],
-        "geometry_report": str(GEOMETRY_REPORT_PATH.relative_to(DATA_DIR.parent)),
+        "terrain": terrain,
+        "timeline": {
+            "source_map_seconds": FILM_DURATION_SECONDS,
+            "delivery_map_seconds": map_duration_seconds,
+            "speed_factor": (
+                FILM_DURATION_SECONDS / map_duration_seconds if terrain else 1.0
+            ),
+        },
+        "voiceover": {
+            "enabled": voiceover_path is not None,
+            "voice": VOICEOVER_VOICE if terrain else None,
+            "rate_words_per_minute": VOICEOVER_RATE if terrain else None,
+            "delay_seconds": VOICEOVER_DELAY_SECONDS if terrain else None,
+            "script": str(VOICEOVER_SCRIPT_PATH.relative_to(DATA_DIR.parent)),
+            "audio_path": (
+                str(voiceover_path.relative_to(DATA_DIR.parent))
+                if voiceover_path is not None
+                else None
+            ),
+        },
+        "final_heading_degrees": camera_angles(CAMERA_HEADING_EASE_END_SECONDS)[1],
+        "geometry_report": str(geometry_report_path.relative_to(DATA_DIR.parent)),
         "geometry_tests_pass": geometry["passes"],
         "identity_checks": identity_checks,
         "identity_max_pixel_difference": identity_max,
@@ -1641,9 +1807,9 @@ def render_final_film(
             "fade_out_seconds": END_CARD_FADE_SECONDS,
         },
         "encoding": {
-            "h264_2160p": "H.264 High, yuv420p, CRF 14, deterministic blue-noise dither",
-            "master": "ProRes 422 HQ, yuv422p10le",
-            "h264_1080p": "Lanczos downsample, H.264 High, yuv420p, CRF 16",
+            "h264_2160p": "H.264 High, yuv420p, CRF 14, deterministic blue-noise dither; AAC 192 kb/s narration",
+            "master": "ProRes 422 HQ, yuv422p10le; 24-bit PCM narration",
+            "h264_1080p": "Lanczos downsample, H.264 High, yuv420p, CRF 16; AAC narration",
         },
         "timing": {
             "master_render_and_encode_seconds": master_wall_seconds,
@@ -1655,9 +1821,7 @@ def render_final_film(
     }
     if not report["duration_check"]["passes"]:
         raise RuntimeError(f"Final duration check failed: {durations}")
-    FINAL_REPORT_PATH.write_text(
-        json.dumps(report, indent=2) + "\n", encoding="utf-8"
-    )
+    final_report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report
 
 
@@ -1698,9 +1862,7 @@ def _identity_checks(scene: FilmScene) -> list[dict]:
                 "seconds": seconds,
                 "mixture_amount": mixture_amount(seconds),
                 "max_pixel_difference": int(
-                    np.max(
-                        np.abs(final.astype(np.int16) - baseline.astype(np.int16))
-                    )
+                    np.max(np.abs(final.astype(np.int16) - baseline.astype(np.int16)))
                 ),
             }
         )
@@ -1734,12 +1896,7 @@ def _terrain_identity_checks(
             {
                 "seconds": seconds,
                 "max_pixel_difference": int(
-                    np.max(
-                        np.abs(
-                            final.astype(np.int16)
-                            - baseline.astype(np.int16)
-                        )
-                    )
+                    np.max(np.abs(final.astype(np.int16) - baseline.astype(np.int16)))
                 ),
             }
         )
@@ -1787,9 +1944,7 @@ def source_tile_edge_luminance_check(
         or y1 + offset + line >= size[1]
     ):
         raise RuntimeError("Source tile seam lines are outside the render frame")
-    luminance = frame.astype(np.float64) @ np.array(
-        [0.2126, 0.7152, 0.0722]
-    )
+    luminance = frame.astype(np.float64) @ np.array([0.2126, 0.7152, 0.0722])
     high_pass = np.abs(luminance - gaussian_filter(luminance, sigma=2.0))
     boundary_coordinates = []
     reference_coordinates = []
@@ -1841,9 +1996,7 @@ def source_tile_edge_luminance_check(
     high_pass_p99_absolute_relative_difference = (
         abs(boundary_high_pass_p99 - reference_high_pass_p99) / normalizer
     )
-    high_pass_p99_relative_difference = (
-        high_pass_p99_absolute_relative_difference
-    )
+    high_pass_p99_relative_difference = high_pass_p99_absolute_relative_difference
     limit = 0.005
     return {
         "line_pixels": line,
@@ -1854,9 +2007,7 @@ def source_tile_edge_luminance_check(
         "mean_relative_difference": float(mean_relative_difference),
         "boundary_high_pass_p99": boundary_high_pass_p99,
         "reference_high_pass_p99": reference_high_pass_p99,
-        "high_pass_p99_relative_difference": float(
-            high_pass_p99_relative_difference
-        ),
+        "high_pass_p99_relative_difference": float(high_pass_p99_relative_difference),
         "high_pass_p99_absolute_relative_difference": float(
             high_pass_p99_absolute_relative_difference
         ),
@@ -1947,12 +2098,9 @@ def render_terrain_shade_preview(
                 TERRAIN_PREVIEW_SIZE,
                 apply_fade=False,
             )
-            path = (
-                TERRAIN_PREVIEW_DIR
-                / (
-                    f"{label}_falloff_noise_"
-                    f"{int(round(noise_amplitude * 100)):02d}pct.png"
-                )
+            path = TERRAIN_PREVIEW_DIR / (
+                f"{label}_falloff_noise_"
+                f"{int(round(noise_amplitude * 100)):02d}pct.png"
             )
             Image.fromarray(frame).save(path, optimize=True)
             frames[(noise_amplitude, seconds)] = Image.fromarray(frame)
@@ -1977,16 +2125,13 @@ def render_terrain_shade_preview(
         "RGB",
         (
             contact_width,
-            len(TERRAIN_FALLOFF_NOISE_COMPARISON)
-            * (image_height + label_height),
+            len(TERRAIN_FALLOFF_NOISE_COMPARISON) * (image_height + label_height),
         ),
         (24, 24, 24),
     )
     draw = ImageDraw.Draw(sheet)
     font = _font(22)
-    for row_index, noise_amplitude in enumerate(
-        TERRAIN_FALLOFF_NOISE_COMPARISON
-    ):
+    for row_index, noise_amplitude in enumerate(TERRAIN_FALLOFF_NOISE_COMPARISON):
         y = row_index * (image_height + label_height)
         for column_index, (seconds, time_label) in enumerate(
             ((105.0, "1:45"), (0.0, "0:00 daylight"))
@@ -2016,12 +2161,20 @@ def render_terrain_shade_preview(
     )
     class_shades = {
         str(class_value): [
-            float(scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].facet_shades[
-                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
-            ].min()),
-            float(scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].facet_shades[
-                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
-            ].max()),
+            float(
+                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE]
+                .facet_shades[
+                    scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
+                ]
+                .min()
+            ),
+            float(
+                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE]
+                .facet_shades[
+                    scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
+                ]
+                .max()
+            ),
         ]
         for class_value in (1, 2, 3)
     }
@@ -2066,24 +2219,16 @@ def render_terrain_shade_preview(
             "terrain_off": flat_edge_check,
             "terrain_shade_by_noise_amplitude": [
                 {
-                    "noise_amplitude_fraction": row[
-                        "noise_amplitude_fraction"
-                    ],
+                    "noise_amplitude_fraction": row["noise_amplitude_fraction"],
                     **row["edge_luminance"],
                 }
                 for row in sweep_rows
             ],
             "previous_commit": {
                 "terrain_off_relative_difference": 0.002439001270626769,
-                "terrain_shade_300m_relative_difference": (
-                    0.0011049387903049254
-                ),
-                "terrain_shade_600m_relative_difference": (
-                    0.0012586301659322733
-                ),
-                "terrain_shade_800m_relative_difference": (
-                    0.0016403880147584054
-                ),
+                "terrain_shade_300m_relative_difference": (0.0011049387903049254),
+                "terrain_shade_600m_relative_difference": (0.0012586301659322733),
+                "terrain_shade_800m_relative_difference": (0.0016403880147584054),
                 "limit": 0.01,
             },
         },
@@ -2142,9 +2287,10 @@ def render_terrain_preview(
         mixture_override=0.0,
     )
     Image.fromarray(opening).save(TERRAIN_OPENING_STILL_PATH, optimize=True)
-    global_times = TERRAIN_ORBIT_START_SECONDS + np.arange(
-        int(round(TERRAIN_ORBIT_DURATION_SECONDS * FPS))
-    ) / FPS
+    global_times = (
+        TERRAIN_ORBIT_START_SECONDS
+        + np.arange(int(round(TERRAIN_ORBIT_DURATION_SECONDS * FPS))) / FPS
+    )
     rows, wall_seconds = _encode_times(
         terrain_scene,
         TERRAIN_ORBIT_PATH,
@@ -2186,9 +2332,7 @@ def render_terrain_preview(
             "max_pixel_difference": max(
                 row["max_pixel_difference"] for row in identity
             ),
-            "passes": all(
-                row["max_pixel_difference"] == 0 for row in identity
-            ),
+            "passes": all(row["max_pixel_difference"] == 0 for row in identity),
         },
         "orbit_preview": {
             "global_seconds": [
@@ -2206,9 +2350,7 @@ def render_terrain_preview(
         "opening_still": {
             "size": [1920, 1080],
             "render_seconds": opening_metadata["render_seconds"],
-            "path": str(
-                TERRAIN_OPENING_STILL_PATH.relative_to(DATA_DIR.parent)
-            ),
+            "path": str(TERRAIN_OPENING_STILL_PATH.relative_to(DATA_DIR.parent)),
         },
     }
     TERRAIN_LOCKED_REPORT_PATH.write_text(
@@ -2243,9 +2385,10 @@ def render_phase4_preview(
     SHIMMER_DIR.mkdir(parents=True, exist_ok=True)
     scene = build_scene(seed)
 
-    shimmer_times = SHIMMER_START_SECONDS + np.arange(
-        int(round(SHIMMER_DURATION_SECONDS * FPS))
-    ) / FPS
+    shimmer_times = (
+        SHIMMER_START_SECONDS
+        + np.arange(int(round(SHIMMER_DURATION_SECONDS * FPS))) / FPS
+    )
     shimmer_rows, shimmer_wall = _encode_times(
         scene,
         SHIMMER_PATH,
@@ -2254,11 +2397,7 @@ def render_phase4_preview(
     )
 
     fast_duration = FILM_DURATION_SECONDS / FAST_PREVIEW_SPEED
-    fast_times = (
-        np.arange(int(round(fast_duration * FPS)))
-        / FPS
-        * FAST_PREVIEW_SPEED
-    )
+    fast_times = np.arange(int(round(fast_duration * FPS))) / FPS * FAST_PREVIEW_SPEED
     fast_rows, fast_wall = _encode_times(
         scene,
         FAST_PREVIEW_PATH,

@@ -103,6 +103,9 @@ def main() -> None:
                 render_final_film(
                     terrain=args.terrain,
                     exaggeration=args.exaggeration,
+                    terrain_shade=args.terrain_shade,
+                    shade_strength=args.shade_strength,
+                    terrain_smoothing_metres=args.terrain_smoothing,
                 ),
                 indent=2,
             )

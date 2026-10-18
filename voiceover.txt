@@ -1,0 +1,11 @@
+Great Salt Lake is often pictured as a fixed shape. It is not. Its shoreline moves with every foot of elevation.
+
+This image begins at the lake's measured level: four thousand one hundred eighty-nine point six feet, on October ninth, twenty twenty-six.
+
+In daylight, the missing water is hidden inside the land. The triangles use different reflectance spectra that look the same under D sixty-five daylight. As the light warms toward tungsten, those spectra separate.
+
+Pink marks the north arm. Blue-green marks the south. The color reveals water that would return if the lake rose to four thousand one hundred ninety-eight feet, a level associated with a healthier lake.
+
+The shoreline is reconstructed from Landsat water-occurrence frequency, calibrated to the lake's official elevation-area relationship. Managed evaporation ponds are excluded. The relief comes from United States Geological Survey three D elevation data, smoothed and exaggerated four times.
+
+When daylight returns, the vanished lake disappears again. The land has not moved. Only the light has changed.

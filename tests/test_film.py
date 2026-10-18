@@ -18,6 +18,8 @@ from film import (
     D65_EQUAL_Y,
     END_CARD_LINES,
     FILM_DURATION_SECONDS,
+    TERRAIN_FINAL_MAP_DURATION_SECONDS,
+    TERRAIN_FINAL_TOTAL_DURATION_SECONDS,
     TOTAL_DURATION_SECONDS,
     YBAR,
     camera_angles,
@@ -25,6 +27,7 @@ from film import (
     mixture_amount,
     render_end_card,
     smootherstep,
+    terrain_final_source_seconds,
 )
 
 
@@ -79,10 +82,7 @@ def test_per_frame_daylight_identity_is_exact() -> None:
         205.0,
     ]
     assert all(row["mixture_amount"] == 0.0 for row in result["identity_checks"])
-    assert all(
-        row["max_pixel_difference"] == 0
-        for row in result["identity_checks"]
-    )
+    assert all(row["max_pixel_difference"] == 0 for row in result["identity_checks"])
 
 
 def test_camera_geometry_framing_and_end_states() -> None:
@@ -90,10 +90,10 @@ def test_camera_geometry_framing_and_end_states() -> None:
     assert camera["geometry"].startswith("flat plane")
     assert camera["supersample"] == CAMERA_SUPERSAMPLE == 2
     assert camera["extended_land"]["hard_edge_visible"] is False
-    assert abs(
-        camera["opening"]["healthy_fill_fraction"]
-        - CAMERA_HEALTHY_FILL_FRACTION
-    ) < 1e-6
+    assert (
+        abs(camera["opening"]["healthy_fill_fraction"] - CAMERA_HEALTHY_FILL_FRACTION)
+        < 1e-6
+    )
     assert camera["opening"]["tilt_degrees"] == 0.0
     assert camera["opening"]["heading_degrees"] == 0.0
     assert camera["final_daylight"]["tilt_degrees"] == 0.0
@@ -170,6 +170,17 @@ def test_end_card_timing_copy_and_fades() -> None:
     assert metadata["opacity"] == 1.0
     assert middle.shape == (360, 640, 3)
     assert middle.max() > 0
+
+
+def test_terrain_final_cut_is_brisk_and_preserves_full_arc() -> None:
+    assert TERRAIN_FINAL_MAP_DURATION_SECONDS == 85.0
+    assert TERRAIN_FINAL_TOTAL_DURATION_SECONDS == 90.0
+    assert terrain_final_source_seconds(0.0) == 0.0
+    assert terrain_final_source_seconds(85.0) == FILM_DURATION_SECONDS
+    assert np.isclose(
+        terrain_final_source_seconds(42.5),
+        FILM_DURATION_SECONDS / 2.0,
+    )
 
 
 def test_final_deliveries_are_exactly_3m35s() -> None:
