@@ -12,7 +12,6 @@ from data import DATA_DIR
 from mesh import MESH_PATH
 from relief import (
     DEM_PATH,
-    SMOOTHING_METRES,
     SUN_ALTITUDE_DEGREES,
     SUN_AZIMUTH_DEGREES,
 )
@@ -22,9 +21,11 @@ LAKE_LEVEL_FT = 4_198.0
 FEET_PER_METRE = 3.280839895013123
 DEFAULT_EXAGGERATION = 2.0
 SHORELINE_RAMP_METRES = 1_000.0
-EDGE_FADE_FRACTION = 0.08
 PIXEL_SIZE_METRES = 30.0
 DEFAULT_SHADE_STRENGTH = 0.6
+DEFAULT_TERRAIN_SMOOTHING_METRES = 300.0
+RADIAL_FULL_RADIUS = 0.78
+RADIAL_ZERO_RADIUS = 0.90
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,11 @@ class TerrainGeometry:
     heights_world: np.ndarray
     elevations_metres: np.ndarray
     flat_vertex_mask: np.ndarray
-    edge_fade: np.ndarray
+    radial_falloff: np.ndarray
+    radial_distance: np.ndarray
+    healthy_centroid: np.ndarray
+    radial_full_radius: float
+    radial_zero_radius: float
     shoreline_ramp: np.ndarray
     frame_height_metres: float
     exaggeration: float
@@ -134,20 +139,23 @@ def build_vertex_terrain(
     points: np.ndarray,
     *,
     exaggeration: float = DEFAULT_EXAGGERATION,
-    smoothing_metres: float = SMOOTHING_METRES,
+    smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
     shoreline_ramp_metres: float = SHORELINE_RAMP_METRES,
-    edge_fade_fraction: float = EDGE_FADE_FRACTION,
+    radial_full_radius: float = RADIAL_FULL_RADIUS,
+    radial_zero_radius: float = RADIAL_ZERO_RADIUS,
 ) -> TerrainGeometry:
     """Sample the DEM and return deterministic film-space vertex heights.
 
     The lake, managed impoundments, and reconstructed 4,198 ft extent are an
-    exactly flat z=0 plane. Terrain begins with a smooth exterior ramp and
-    returns to z=0 at every outer edge of the repeatable source tile.
+    exactly flat z=0 plane. Terrain begins with a smooth shoreline ramp and
+    returns to z=0 on an elliptical radial falloff before the source boundary.
     """
     if exaggeration < 0.0:
         raise ValueError("Terrain exaggeration must be non-negative")
-    if shoreline_ramp_metres <= 0.0 or not 0.0 < edge_fade_fraction < 0.5:
-        raise ValueError("Terrain ramp and edge fade must be positive")
+    if shoreline_ramp_metres <= 0.0 or smoothing_metres <= 0.0:
+        raise ValueError("Terrain smoothing and shoreline ramp must be positive")
+    if not 0.0 < radial_full_radius < radial_zero_radius:
+        raise ValueError("Terrain radial radii must satisfy 0 < r0 < r1")
 
     with rasterio.open(DEM_PATH) as dataset:
         elevation = dataset.read(1).astype(np.float32)
@@ -186,10 +194,31 @@ def build_vertex_terrain(
     ).astype(np.float32)
     shoreline_ramp = _sample(shoreline_ramp_raster, points, order=1)
 
-    edge_distance = np.minimum.reduce(
-        (points[:, 0], 1.0 - points[:, 0], points[:, 1], 1.0 - points[:, 1])
+    mesh_triangles = mesh["points"][mesh["simplices"]]
+    cross = (
+        (mesh_triangles[:, 1, 0] - mesh_triangles[:, 0, 0])
+        * (mesh_triangles[:, 2, 1] - mesh_triangles[:, 0, 1])
+        - (mesh_triangles[:, 1, 1] - mesh_triangles[:, 0, 1])
+        * (mesh_triangles[:, 2, 0] - mesh_triangles[:, 0, 0])
     )
-    edge_fade = _smootherstep(edge_distance / edge_fade_fraction)
+    triangle_areas = np.abs(cross) / 2.0
+    healthy_triangles = np.isin(mesh["classes"], (1, 2))
+    healthy_centroid = np.average(
+        mesh["centroids"][healthy_triangles],
+        axis=0,
+        weights=triangle_areas[healthy_triangles],
+    )
+    radial_distance = np.sqrt(
+        ((points[:, 0] - healthy_centroid[0]) / 0.5) ** 2
+        + ((points[:, 1] - healthy_centroid[1]) / 0.5) ** 2
+    )
+    radial_progress = (
+        (radial_distance - radial_full_radius)
+        / (radial_zero_radius - radial_full_radius)
+    )
+    radial_falloff = 1.0 - _smootherstep(radial_progress)
+    radial_falloff[radial_distance >= radial_zero_radius] = 0.0
+    radial_falloff[radial_distance <= radial_full_radius] = 1.0
 
     frame_height_metres = (classes.shape[0] - 1) * pixel_size
     above_lake_metres = np.maximum(
@@ -200,17 +229,22 @@ def build_vertex_terrain(
         above_lake_metres
         * exaggeration
         * shoreline_ramp
-        * edge_fade
+        * radial_falloff
         / frame_height_metres
     )
     heights_world[flat_vertex_mask] = 0.0
-    heights_world[edge_distance <= np.finfo(np.float64).eps] = 0.0
+    boundary = np.any((points == 0.0) | (points == 1.0), axis=1)
+    heights_world[boundary] = 0.0
 
     return TerrainGeometry(
         heights_world=heights_world.astype(np.float64),
         elevations_metres=vertex_elevation,
         flat_vertex_mask=flat_vertex_mask,
-        edge_fade=edge_fade.astype(np.float64),
+        radial_falloff=radial_falloff.astype(np.float64),
+        radial_distance=radial_distance.astype(np.float64),
+        healthy_centroid=healthy_centroid.astype(np.float64),
+        radial_full_radius=float(radial_full_radius),
+        radial_zero_radius=float(radial_zero_radius),
         shoreline_ramp=shoreline_ramp.astype(np.float64),
         frame_height_metres=float(frame_height_metres),
         exaggeration=float(exaggeration),

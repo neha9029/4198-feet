@@ -9,7 +9,11 @@ import pytest
 
 import film
 from data import SEED
-from film import build_scene, render_camera_frame
+from film import (
+    build_scene,
+    render_camera_frame,
+    source_tile_edge_luminance_check,
+)
 from mesh import MESH_PATH
 from terrain import build_vertex_terrain
 
@@ -96,7 +100,7 @@ def test_shaded_water_facets_are_exactly_unshaded(
 ) -> None:
     assert shaded_terrain_scene.terrain_shade_enabled is True
     assert shaded_terrain_scene.baked_hillshade_enabled is False
-    for class_value in (1, 2):
+    for class_value in (1, 2, 3):
         shades = shaded_terrain_scene.facet_shades[
             shaded_terrain_scene.classes == class_value
         ]
@@ -112,9 +116,10 @@ def test_lakebed_vertices_and_outer_boundary_are_exactly_flat() -> None:
     )
     assert np.all(geometry.flat_vertex_mask[lakebed_vertices])
     assert np.all(geometry.heights_world[lakebed_vertices] == 0.0)
-    boundary = geometry.edge_fade == 0.0
-    assert np.count_nonzero(boundary) > 0
-    assert np.all(geometry.heights_world[boundary] == 0.0)
+    outside = geometry.radial_distance >= geometry.radial_zero_radius
+    assert np.count_nonzero(outside) > 0
+    assert np.all(geometry.radial_falloff[outside] == 0.0)
+    assert np.all(geometry.heights_world[outside] == 0.0)
 
 
 def test_source_tile_boundary_vertices_are_exactly_flat() -> None:
@@ -124,6 +129,15 @@ def test_source_tile_boundary_vertices_are_exactly_flat() -> None:
     boundary = np.any((points == 0.0) | (points == 1.0), axis=1)
     assert np.count_nonzero(boundary) > 0
     assert np.all(geometry.heights_world[boundary] == 0.0)
+
+
+def test_source_tile_edge_luminance_is_continuous(
+    shaded_terrain_scene,
+) -> None:
+    terrain_off = source_tile_edge_luminance_check(build_scene(SEED))
+    terrain_shade = source_tile_edge_luminance_check(shaded_terrain_scene)
+    assert terrain_off["relative_difference"] < 0.01
+    assert terrain_shade["relative_difference"] < 0.01
 
 
 def test_non_source_terrain_tiles_are_projected_flat(

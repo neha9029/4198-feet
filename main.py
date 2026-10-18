@@ -58,6 +58,12 @@ def main() -> None:
         default=0.6,
         help="Lambert terrain-shade strength in [0, 1] (default: 0.6)",
     )
+    parser.add_argument(
+        "--terrain-smoothing",
+        type=float,
+        default=300.0,
+        help="3D terrain DEM smoothing in metres (default: 300)",
+    )
     args = parser.parse_args()
     if args.phase == "phase1":
         print(json.dumps(run_phase1(), indent=2))
@@ -85,6 +91,7 @@ def main() -> None:
                     exaggeration=args.exaggeration,
                     terrain_shade=args.terrain_shade,
                     shade_strength=args.shade_strength,
+                    terrain_smoothing_metres=args.terrain_smoothing,
                 ),
                 indent=2,
             )

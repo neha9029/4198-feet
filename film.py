@@ -33,7 +33,12 @@ from metamers import (
     SPECTRA_FINAL_PATH,
 )
 from relief import RELIEF_FACTORS_PATH
-from terrain import DEFAULT_SHADE_STRENGTH
+from terrain import (
+    DEFAULT_SHADE_STRENGTH,
+    DEFAULT_TERRAIN_SMOOTHING_METRES,
+    RADIAL_FULL_RADIUS,
+    RADIAL_ZERO_RADIUS,
+)
 
 
 # Film and light timing.
@@ -105,8 +110,8 @@ TERRAIN_PREVIEW_DIR = FILM_DIR / "terrain_preview"
 TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
 TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
 TERRAIN_PREVIEW_SIZE = (1600, 900)
-TERRAIN_SHADE_SWEEP = (4.0, 6.0, 8.0)
-TERRAIN_SHADE_BEST_EXAGGERATION = 4.0
+TERRAIN_SHADE_EXAGGERATION = 4.0
+TERRAIN_SMOOTHING_SWEEP = (300.0, 600.0, 800.0)
 TERRAIN_SHADE_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_shade_report.json"
 
 
@@ -140,6 +145,7 @@ class FilmScene:
     terrain_exaggeration: float
     terrain_max_height_world: float
     terrain_max_height_metres: float
+    terrain_smoothing_metres: float
     terrain_shade_enabled: bool
     terrain_shade_strength: float
     facet_shades: np.ndarray
@@ -282,6 +288,7 @@ def build_scene(
     exaggeration: float = 2.0,
     terrain_shade: bool = False,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
+    terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> FilmScene:
     """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
@@ -314,6 +321,7 @@ def build_scene(
         terrain_geometry = build_vertex_terrain(
             points,
             exaggeration=exaggeration,
+            smoothing_metres=terrain_smoothing_metres,
         )
         points_world[:, 2] = terrain_geometry.heights_world
         terrain_max_height_world = terrain_geometry.max_height_world
@@ -389,6 +397,7 @@ def build_scene(
         terrain_exaggeration=float(exaggeration),
         terrain_max_height_world=terrain_max_height_world,
         terrain_max_height_metres=terrain_max_height_metres,
+        terrain_smoothing_metres=float(terrain_smoothing_metres),
         terrain_shade_enabled=bool(terrain_shade),
         terrain_shade_strength=float(shade_strength),
         facet_shades=facet_shades,
@@ -1587,6 +1596,76 @@ def _terrain_identity_checks(
     return checks
 
 
+def source_tile_edge_luminance_check(
+    scene: FilmScene,
+    *,
+    size: tuple[int, int] = (640, 360),
+    band_pixels: int = 6,
+) -> dict:
+    """Compare mean daylight luminance just inside/outside the source tile."""
+    frame, _ = render_camera_frame(
+        scene,
+        0.0,
+        size,
+        apply_fade=False,
+        mixture_override=0.0,
+    )
+    camera = camera_state(scene, 0.0, size)
+    projected, _ = _project(
+        scene.points_world,
+        camera.tilt_degrees,
+        camera.heading_degrees,
+        camera.distance,
+        size,
+        camera.screen_shift_fraction,
+    )
+    x0, y0 = np.ceil(projected.min(axis=0)).astype(int)
+    x1, y1 = np.floor(projected.max(axis=0)).astype(int)
+    band = int(band_pixels)
+    trim = band * 2
+    if (
+        x0 < band
+        or y0 < band
+        or x1 + band >= size[0]
+        or y1 + band >= size[1]
+    ):
+        raise RuntimeError("Source tile edge bands are outside the render frame")
+    luminance = frame.astype(np.float64) @ np.array(
+        [0.2126, 0.7152, 0.0722]
+    )
+    outside = np.concatenate(
+        [
+            luminance[y0 + trim : y1 - trim, x0 - band : x0].ravel(),
+            luminance[y0 + trim : y1 - trim, x1 + 1 : x1 + 1 + band].ravel(),
+            luminance[y0 - band : y0, x0 + trim : x1 - trim].ravel(),
+            luminance[y1 + 1 : y1 + 1 + band, x0 + trim : x1 - trim].ravel(),
+        ]
+    )
+    inside = np.concatenate(
+        [
+            luminance[y0 + trim : y1 - trim, x0 : x0 + band].ravel(),
+            luminance[y0 + trim : y1 - trim, x1 + 1 - band : x1 + 1].ravel(),
+            luminance[y0 : y0 + band, x0 + trim : x1 - trim].ravel(),
+            luminance[y1 + 1 - band : y1 + 1, x0 + trim : x1 - trim].ravel(),
+        ]
+    )
+    outside_mean = float(np.mean(outside))
+    inside_mean = float(np.mean(inside))
+    relative_difference = abs(outside_mean - inside_mean) / max(
+        (outside_mean + inside_mean) / 2.0,
+        np.finfo(np.float64).eps,
+    )
+    return {
+        "band_pixels": band,
+        "source_bounds_px": [int(x0), int(y0), int(x1), int(y1)],
+        "outside_mean_luminance": outside_mean,
+        "inside_mean_luminance": inside_mean,
+        "relative_difference": float(relative_difference),
+        "limit": 0.01,
+        "passes": bool(relative_difference < 0.01),
+    }
+
+
 def _contact_sheet(
     rows: list[tuple[float, Image.Image, Image.Image]],
     destination: Path,
@@ -1629,94 +1708,112 @@ def render_terrain_shade_preview(
     *,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
 ) -> dict:
-    """Render only the experimental normal-shaded terrain still sweep."""
+    """Render only the experimental radial/smoothing terrain still sweep."""
     TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    sweep_images = []
     sweep_rows = []
     scenes: dict[float, FilmScene] = {}
-    for exaggeration in TERRAIN_SHADE_SWEEP:
+    frames: dict[tuple[float, float], Image.Image] = {}
+    identity_rows = []
+    for smoothing_metres in TERRAIN_SMOOTHING_SWEEP:
         scene = build_scene(
             seed,
             terrain=True,
-            exaggeration=exaggeration,
+            exaggeration=TERRAIN_SHADE_EXAGGERATION,
             terrain_shade=True,
             shade_strength=shade_strength,
+            terrain_smoothing_metres=smoothing_metres,
         )
-        scenes[exaggeration] = scene
-        frame, metadata = render_camera_frame(
-            scene,
-            105.0,
-            TERRAIN_PREVIEW_SIZE,
-            apply_fade=False,
-        )
-        path = (
-            TERRAIN_PREVIEW_DIR
-            / f"105s_terrain_shade_exaggeration_{exaggeration:.1f}x.png"
-        )
-        Image.fromarray(frame).save(path, optimize=True)
-        sweep_images.append(Image.fromarray(frame))
-        sweep_rows.append(
-            {
-                "exaggeration": exaggeration,
-                "shade_strength": shade_strength,
-                "shade_min_max": [
-                    float(scene.facet_shades.min()),
-                    float(scene.facet_shades.max()),
-                ],
+        scenes[smoothing_metres] = scene
+        row = {
+            "smoothing_metres": smoothing_metres,
+            "exaggeration": TERRAIN_SHADE_EXAGGERATION,
+            "shade_strength": shade_strength,
+            "shade_min_max": [
+                float(scene.facet_shades.min()),
+                float(scene.facet_shades.max()),
+            ],
+            "frames": {},
+        }
+        for seconds, label in ((105.0, "105s"), (0.0, "000s")):
+            frame, metadata = render_camera_frame(
+                scene,
+                seconds,
+                TERRAIN_PREVIEW_SIZE,
+                apply_fade=False,
+            )
+            path = (
+                TERRAIN_PREVIEW_DIR
+                / f"{label}_radial_smoothing_{int(smoothing_metres)}m.png"
+            )
+            Image.fromarray(frame).save(path, optimize=True)
+            frames[(smoothing_metres, seconds)] = Image.fromarray(frame)
+            row["frames"][label] = {
                 "render_seconds": metadata["render_seconds"],
                 "path": str(path.relative_to(DATA_DIR.parent)),
             }
+        identity_rows.append(
+            {
+                "smoothing_metres": smoothing_metres,
+                "samples": _terrain_identity_checks(scene),
+            }
         )
+        row["edge_luminance"] = source_tile_edge_luminance_check(scene)
+        sweep_rows.append(row)
 
     contact_width = 1_600
-    image_height = 300
+    panel_width = 800
+    image_height = 450
     label_height = 42
-    widths = (534, 533, 533)
     sheet = Image.new(
         "RGB",
-        (contact_width, image_height + label_height),
+        (
+            contact_width,
+            len(TERRAIN_SMOOTHING_SWEEP) * (image_height + label_height),
+        ),
         (24, 24, 24),
     )
     draw = ImageDraw.Draw(sheet)
-    x = 0
-    for image, width, exaggeration in zip(
-        sweep_images,
-        widths,
-        TERRAIN_SHADE_SWEEP,
-    ):
-        sheet.paste(
-            image.resize((width, image_height), Image.Resampling.LANCZOS),
-            (x, label_height),
-        )
-        draw.text(
-            (x + 16, 8),
-            (
-                f"1:45 · ×{exaggeration:.0f} · "
-                f"normal shade s={shade_strength:.1f}"
-            ),
-            font=_font(22),
-            fill=(220, 220, 220),
-        )
-        x += width
-    contact_path = TERRAIN_PREVIEW_DIR / "shade_sweep.png"
+    font = _font(22)
+    for row_index, smoothing_metres in enumerate(TERRAIN_SMOOTHING_SWEEP):
+        y = row_index * (image_height + label_height)
+        for column_index, (seconds, time_label) in enumerate(
+            ((105.0, "1:45"), (0.0, "0:00 daylight"))
+        ):
+            x = column_index * panel_width
+            image = frames[(smoothing_metres, seconds)].resize(
+                (panel_width, image_height),
+                Image.Resampling.LANCZOS,
+            )
+            sheet.paste(image, (x, y + label_height))
+            draw.text(
+                (x + 16, y + 8),
+                (
+                    f"{int(smoothing_metres)} m · {time_label} · "
+                    f"×{TERRAIN_SHADE_EXAGGERATION:.0f} · s={shade_strength:.1f}"
+                ),
+                font=font,
+                fill=(220, 220, 220),
+            )
+    contact_path = TERRAIN_PREVIEW_DIR / "radial_sweep.png"
     sheet.save(contact_path, optimize=True)
 
-    best_scene = scenes[TERRAIN_SHADE_BEST_EXAGGERATION]
-    daylight, daylight_metadata = render_camera_frame(
-        best_scene,
-        0.0,
-        TERRAIN_PREVIEW_SIZE,
-        apply_fade=False,
+    identity_max = max(
+        sample["max_pixel_difference"]
+        for row in identity_rows
+        for sample in row["samples"]
     )
-    daylight_path = (
-        TERRAIN_PREVIEW_DIR
-        / f"000s_terrain_shade_exaggeration_{TERRAIN_SHADE_BEST_EXAGGERATION:.1f}x.png"
-    )
-    Image.fromarray(daylight).save(daylight_path, optimize=True)
-
-    identity = _terrain_identity_checks(best_scene)
-    water = np.isin(best_scene.classes, (1, 2))
-    water_shades = best_scene.facet_shades[water]
+    class_shades = {
+        str(class_value): [
+            float(scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].facet_shades[
+                scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].classes == class_value
+            ].min()),
+            float(scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].facet_shades[
+                scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].classes == class_value
+            ].max()),
+        ]
+        for class_value in (1, 2, 3)
+    }
+    flat_edge_check = source_tile_edge_luminance_check(build_scene(seed))
     report = {
         "seed": seed,
         "preview_only": True,
@@ -1725,36 +1822,40 @@ def render_terrain_shade_preview(
             "shade_strength": shade_strength,
             "sun_azimuth_degrees": 315.0,
             "sun_altitude_degrees": 45.0,
-            "baked_hillshade_enabled": best_scene.baked_hillshade_enabled,
+            "baked_hillshade_enabled": False,
             "surrounding_tiles_shade": 1.0,
-            "best_exaggeration": TERRAIN_SHADE_BEST_EXAGGERATION,
-            "water_shade_min_max": [
-                float(water_shades.min()),
-                float(water_shades.max()),
-            ],
-            "all_water_facets_exactly_one": bool(
-                np.all(water_shades == 1.0)
+            "exaggeration": TERRAIN_SHADE_EXAGGERATION,
+            "class_shade_min_max": class_shades,
+            "all_water_and_managed_facets_exactly_one": all(
+                bounds == [1.0, 1.0] for bounds in class_shades.values()
             ),
+        },
+        "radial_falloff": {
+            "coordinate_system": (
+                "distance from area-weighted healthy-lake centroid, scaled "
+                "by the 16:9 frame half-extents"
+            ),
+            "full_height_radius": RADIAL_FULL_RADIUS,
+            "zero_height_radius": RADIAL_ZERO_RADIUS,
         },
         "d65_identity": {
-            "samples": identity,
-            "max_pixel_difference": max(
-                row["max_pixel_difference"] for row in identity
-            ),
-            "passes": all(
-                row["max_pixel_difference"] == 0 for row in identity
-            ),
+            "by_smoothing": identity_rows,
+            "max_pixel_difference": identity_max,
+            "passes": identity_max == 0,
+        },
+        "edge_luminance": {
+            "terrain_off": flat_edge_check,
+            "terrain_shade_by_smoothing": [
+                {
+                    "smoothing_metres": row["smoothing_metres"],
+                    **row["edge_luminance"],
+                }
+                for row in sweep_rows
+            ],
         },
         "sweep": sweep_rows,
-        "daylight": {
-            "seconds": 0.0,
-            "exaggeration": TERRAIN_SHADE_BEST_EXAGGERATION,
-            "render_seconds": daylight_metadata["render_seconds"],
-            "path": str(daylight_path.relative_to(DATA_DIR.parent)),
-        },
         "outputs": {
             "contact_sheet": str(contact_path.relative_to(DATA_DIR.parent)),
-            "daylight_best": str(daylight_path.relative_to(DATA_DIR.parent)),
         },
     }
     TERRAIN_SHADE_REPORT_PATH.write_text(
@@ -1768,6 +1869,7 @@ def render_terrain_preview(
     seed: int = SEED,
     *,
     exaggeration: float = 2.0,
+    terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> dict:
     """Render the requested still-only terrain comparison; never the final film."""
     TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
@@ -1776,6 +1878,7 @@ def render_terrain_preview(
         seed,
         terrain=True,
         exaggeration=exaggeration,
+        terrain_smoothing_metres=terrain_smoothing_metres,
     )
     rows = []
     timing = {"terrain_off_seconds": [], "terrain_on_seconds": []}
@@ -1830,7 +1933,12 @@ def render_terrain_preview(
     sweep_images = []
     sweep_rows = []
     for value in (1.0, 2.0, 3.0):
-        sweep_scene = build_scene(seed, terrain=True, exaggeration=value)
+        sweep_scene = build_scene(
+            seed,
+            terrain=True,
+            exaggeration=value,
+            terrain_smoothing_metres=terrain_smoothing_metres,
+        )
         frame, metadata = render_camera_frame(
             sweep_scene,
             105.0,
@@ -1934,6 +2042,7 @@ def render_phase4_preview(
     exaggeration: float = 2.0,
     terrain_shade: bool = False,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
+    terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> dict:
     """Render the orbit shimmer clip and the four-times-speed full-film preview."""
     if terrain_shade:
@@ -1944,7 +2053,11 @@ def render_phase4_preview(
             shade_strength=shade_strength,
         )
     if terrain:
-        return render_terrain_preview(seed, exaggeration=exaggeration)
+        return render_terrain_preview(
+            seed,
+            exaggeration=exaggeration,
+            terrain_smoothing_metres=terrain_smoothing_metres,
+        )
     FILM_DIR.mkdir(parents=True, exist_ok=True)
     SHIMMER_DIR.mkdir(parents=True, exist_ok=True)
     scene = build_scene(seed)
