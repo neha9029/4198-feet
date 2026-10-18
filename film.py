@@ -967,7 +967,10 @@ def render_camera_frame(
     if output_float:
         channels = []
         for channel_index in range(3):
-            supersampled_channel = palette[:, channel_index][ids]
+            supersampled_channel = np.asarray(
+                palette[:, channel_index][ids],
+                dtype=np.float32,
+            )
             channels.append(
                 np.asarray(
                     Image.fromarray(supersampled_channel, mode="F").resize(

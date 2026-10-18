@@ -25,6 +25,8 @@ from film import (
     camera_angles,
     end_card_opacity,
     mixture_amount,
+    build_scene,
+    render_camera_frame,
     render_end_card,
     smootherstep,
     terrain_final_source_seconds,
@@ -181,6 +183,17 @@ def test_terrain_final_cut_is_brisk_and_preserves_full_arc() -> None:
         terrain_final_source_seconds(42.5),
         FILM_DURATION_SECONDS / 2.0,
     )
+
+
+def test_terrain_float_master_frame_is_finite() -> None:
+    scene = build_scene(terrain=True)
+    frame, _ = render_camera_frame(
+        scene,
+        105.0,
+        (320, 180),
+        output_float=True,
+    )
+    assert np.isfinite(frame).all()
 
 
 def test_final_deliveries_are_exactly_3m35s() -> None:
