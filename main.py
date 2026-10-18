@@ -44,13 +44,14 @@ def main() -> None:
     parser.add_argument(
         "--exaggeration",
         type=float,
-        default=2.0,
-        help="Vertical terrain exaggeration (default: 2.0)",
+        default=4.0,
+        help="Vertical terrain exaggeration (default: 4.0)",
     )
     parser.add_argument(
         "--terrain-shade",
-        action="store_true",
-        help="Use experimental 3D-normal Lambert shading in Phase 4 preview",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use 3D-normal Lambert shading (default: on with --terrain)",
     )
     parser.add_argument(
         "--shade-strength",

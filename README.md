@@ -38,7 +38,7 @@ The optional relief pass uses the public, no-key [AWS Terrain Tiles dataset](htt
 
 The DEM is reprojected to the 30 m UTM 12N film grid, Gaussian-smoothed at 300 m, and lit with a 315° azimuth / 45° altitude soft hillshade. Land, managed, and lost-water base spectra are scaled by 0.92–1.08; current-water spectra are unchanged. Each lost-water cell is then solved from its own modulated base, retaining exact D65 XYZ equality. The relief pass is accepted: the lost-to-land / land-to-land adjacency KS p-value is 0.624, their medians differ by 3.73%, the density difference remains 3.06%, and rendered D65 identity remains exactly zero pixel difference.
 
-Phase 4 can additionally use the DEM as opt-in 3D vertex geometry with `--terrain`, independently Gaussian-smoothed at 600 m by default. The 4,198 ft lakebed, current water, and managed-water AOIs remain exactly flat. Land height is measured above 4,198 ft and eased in over the first 1 km outside the reconstructed shoreline. Toward the source-tile edge, height is multiplied by a broad smootherstep taper: full height ends at 45% of the local radius and reaches zero on the largest centroid-centred ellipse inside a 3% tile margin. A deterministic seed-1931 blend of two- and three-lobe angular waves perturbs the outer radius by up to 12%, capped inside that margin, to prevent the fade from reading as a geometric contour; source-boundary vertices remain exactly zero. The existing spectral hillshade is retained and the geometry is rendered unlit unless experimental `--terrain-shade` is selected, in which case the baked hillshade is disabled and a single per-facet scalar is used instead. Both paths keep each metamer pair identically scaled under D65. All visible facets are sorted globally from back to front so nearby ridges correctly occlude distant terrain. The default vertical setting must be disclosed as **“relief exaggerated ×2”** (or with the selected `--exaggeration` value). 3DEP data courtesy of the U.S. Geological Survey.
+Phase 4 can additionally use opt-in 3D vertex geometry with `--terrain`. **Relief from USGS 3DEP, smoothed 600 m, exaggerated ×4, faded toward the frame edges; lakebed below 4,198 ft is flat.** The locked terrain path uses zero falloff noise and per-facet Lambert shading at strength 0.6; the baked spectral hillshade is disabled so illumination is counted once. Repeated-tile boundary vertices use a shared deterministic irregular cutline, and paired boundary facets receive a light spectral match, preventing a visible rectangular join while preserving native tessellation contrast. Each metamer pair remains identically scaled under D65, and all visible facets are sorted globally from back to front so nearby ridges correctly occlude distant terrain. 3DEP data courtesy of the U.S. Geological Survey.
 
 ## Phase 3 outputs
 
@@ -93,9 +93,9 @@ Apply the uniform N1-N19 decision and run Phase 2 with:
 .venv/bin/python main.py phase3
 .venv/bin/python main.py phase4-preview
 .venv/bin/python main.py phase4-final
-.venv/bin/python main.py phase4-preview --terrain --exaggeration 2.0
+.venv/bin/python main.py phase4-preview --terrain
 # Do not run the terrain final until its preview is approved:
-# .venv/bin/python main.py phase4-final --terrain --exaggeration 2.0
+# .venv/bin/python main.py phase4-final --terrain
 ```
 
 The spectral observer, illuminants, adaptation, colour conversion, smooth-field, and Lloyd routines are vendored with attribution in `engine.py` from `/Users/nehanaik/Documents/pycon/under_another_light.py` and its [public source](https://github.com/neha9029/under-another-light).

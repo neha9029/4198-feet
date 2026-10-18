@@ -27,7 +27,7 @@ FLAT_FRAME_HASHES = {
 
 @pytest.fixture(scope="module")
 def terrain_scene():
-    return build_scene(SEED, terrain=True, exaggeration=2.0)
+    return build_scene(SEED, terrain=True)
 
 
 @pytest.fixture(scope="module")
@@ -124,11 +124,15 @@ def test_lakebed_vertices_and_outer_boundary_are_exactly_flat() -> None:
 
 def test_radial_falloff_is_seeded_broad_and_inside_inset() -> None:
     mesh = np.load(MESH_PATH)
-    noisy = build_vertex_terrain(mesh["points"], exaggeration=2.0)
-    repeated = build_vertex_terrain(mesh["points"], exaggeration=2.0)
+    noisy = build_vertex_terrain(
+        mesh["points"], exaggeration=4.0, radial_noise_amplitude=0.12
+    )
+    repeated = build_vertex_terrain(
+        mesh["points"], exaggeration=4.0, radial_noise_amplitude=0.12
+    )
     smooth = build_vertex_terrain(
         mesh["points"],
-        exaggeration=2.0,
+        exaggeration=4.0,
         radial_noise_amplitude=0.0,
     )
     assert noisy.radial_full_radius == 0.45
@@ -151,13 +155,36 @@ def test_source_tile_boundary_vertices_are_exactly_flat() -> None:
     assert np.all(geometry.heights_world[boundary] == 0.0)
 
 
-def test_source_tile_edge_luminance_is_continuous(
-    shaded_terrain_scene,
-) -> None:
-    terrain_off = source_tile_edge_luminance_check(build_scene(SEED))
-    terrain_shade = source_tile_edge_luminance_check(shaded_terrain_scene)
-    assert terrain_off["relative_difference"] < 0.01
-    assert terrain_shade["relative_difference"] < 0.01
+def test_source_tile_edge_luminance_is_continuous() -> None:
+    terrain_shade = source_tile_edge_luminance_check(
+        build_scene(SEED, terrain=True)
+    )
+    assert terrain_shade["mean_relative_difference"] < 0.005
+    assert terrain_shade["high_pass_p99_relative_difference"] < 0.005
+    assert terrain_shade["passes"] is True
+
+
+def test_locked_terrain_defaults() -> None:
+    scene = build_scene(SEED, terrain=True)
+    assert scene.terrain_exaggeration == 4.0
+    assert scene.terrain_smoothing_metres == 600.0
+    assert scene.terrain_radial_noise_amplitude == 0.0
+    assert scene.terrain_shade_enabled is True
+    assert scene.terrain_shade_strength == 0.6
+    assert scene.seamless_tile_edges is True
+
+
+def test_repeated_tile_boundary_geometry_matches_exactly() -> None:
+    scene = build_scene(SEED, terrain=True)
+    left, right, top, bottom = scene.source_boundary_world
+    assert np.allclose(
+        left + np.array([scene.tile_width, 0.0, 0.0]),
+        right,
+    )
+    assert np.allclose(
+        bottom + np.array([0.0, scene.tile_height, 0.0]),
+        top,
+    )
 
 
 def test_non_source_terrain_tiles_are_projected_flat(

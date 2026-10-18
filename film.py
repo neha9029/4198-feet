@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from data import DATA_DIR, SEED
 from engine import (
@@ -34,6 +34,7 @@ from metamers import (
 )
 from relief import RELIEF_FACTORS_PATH
 from terrain import (
+    DEFAULT_EXAGGERATION,
     DEFAULT_RADIAL_NOISE_AMPLITUDE,
     DEFAULT_SHADE_STRENGTH,
     DEFAULT_TERRAIN_SMOOTHING_METRES,
@@ -75,6 +76,7 @@ EXTENDED_PLANE_MIN_FRUSTUM_MULTIPLE = 3.0
 FOG_START_RADIUS = 1.12
 FOG_END_RADIUS = 1.58
 BACKGROUND_RGB = np.array([244, 241, 232], dtype=np.float32) / 255.0
+TILE_JOIN_JITTER_FRACTION = 0.006
 
 # End card.
 END_CARD_FADE_SECONDS = 1.0
@@ -112,8 +114,14 @@ TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
 TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
 TERRAIN_PREVIEW_SIZE = (1600, 900)
 TERRAIN_SHADE_EXAGGERATION = 4.0
-TERRAIN_FALLOFF_NOISE_COMPARISON = (DEFAULT_RADIAL_NOISE_AMPLITUDE, 0.0)
+TERRAIN_FALLOFF_NOISE_COMPARISON = (0.12, 0.0)
 TERRAIN_SHADE_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_shade_report.json"
+TERRAIN_ORBIT_START_SECONDS = 85.0
+TERRAIN_ORBIT_DURATION_SECONDS = 40.0
+TERRAIN_ORBIT_SIZE = (1280, 720)
+TERRAIN_ORBIT_PATH = TERRAIN_PREVIEW_DIR / "orbit_40s.mp4"
+TERRAIN_OPENING_STILL_PATH = TERRAIN_PREVIEW_DIR / "opening_000s_1080p.png"
+TERRAIN_LOCKED_REPORT_PATH = TERRAIN_PREVIEW_DIR / "locked_preview_report.json"
 
 
 @dataclass(frozen=True)
@@ -152,6 +160,8 @@ class FilmScene:
     terrain_shade_strength: float
     facet_shades: np.ndarray
     baked_hillshade_enabled: bool
+    seamless_tile_edges: bool
+    source_boundary_world: tuple[np.ndarray, ...]
 
 
 def smootherstep(value: float | np.ndarray) -> float | np.ndarray:
@@ -283,15 +293,99 @@ def _triangle_areas(points: np.ndarray, simplices: np.ndarray) -> np.ndarray:
     return np.abs(cross) / 2.0
 
 
+def _match_opposite_tile_edges(
+    points: np.ndarray,
+    simplices: np.ndarray,
+    classes: np.ndarray,
+    source_spectra: np.ndarray,
+    land_spectra: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Give every repeated-tile join one shared boundary-facet spectrum.
+
+    PIL's integer polygon rasteriser includes the shared edge on both adjacent
+    coplanar triangles. If their palettes differ, painter order emphasizes the
+    join after downsampling. Opposite boundaries use the same 33 segments, so
+    pairing them permits a small cross-edge palette match without flattening
+    the native along-edge facet variation.
+    """
+    source = np.asarray(source_spectra, dtype=np.float64).copy()
+    land = np.asarray(land_spectra, dtype=np.float64).copy()
+    parent = np.arange(len(simplices), dtype=np.int32)
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = int(parent[index])
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    triangle_points = points[simplices]
+    for axis in (0, 1):
+        other_axis = 1 - axis
+        side_maps = []
+        for side in (0.0, 1.0):
+            edge = np.sum(triangle_points[:, :, axis] == side, axis=1) >= 2
+            indices = np.flatnonzero(edge)
+            if not np.all(classes[indices] == 0):
+                raise RuntimeError("Source-tile boundary contains non-land facets")
+            spans = np.column_stack(
+                [
+                    triangle_points[indices, :, other_axis].min(axis=1),
+                    triangle_points[indices, :, other_axis].max(axis=1),
+                ]
+            )
+            side_maps.append(
+                {
+                    tuple(np.round(span, 9)): int(index)
+                    for span, index in zip(spans, indices)
+                }
+            )
+        if side_maps[0].keys() != side_maps[1].keys():
+            raise RuntimeError("Opposite source-tile boundary segments differ")
+        for key in side_maps[0]:
+            union(side_maps[0][key], side_maps[1][key])
+
+    components: dict[int, list[int]] = {}
+    boundary_indices = np.flatnonzero(
+        np.sum((triangle_points == 0.0) | (triangle_points == 1.0), axis=(1, 2))
+        >= 2
+    )
+    for index in boundary_indices:
+        components.setdefault(find(int(index)), []).append(int(index))
+    for indices in components.values():
+        # Pull both sides toward a shared component mean without collapsing
+        # the whole boundary strip to one palette. Retaining each facet's
+        # local spectrum prevents a new topology band at its interior edge.
+        component_mean = np.mean(
+            np.vstack([source[indices], land[indices]]),
+            axis=0,
+        )
+        match_strength = 0.20
+        source[indices] = (
+            (1.0 - match_strength) * source[indices]
+            + match_strength * component_mean
+        )
+        land[indices] = (
+            (1.0 - match_strength) * land[indices]
+            + match_strength * component_mean
+        )
+    return source, land
+
+
 def build_scene(
     seed: int = SEED,
     *,
     terrain: bool = False,
-    exaggeration: float = 2.0,
-    terrain_shade: bool = False,
+    exaggeration: float = DEFAULT_EXAGGERATION,
+    terrain_shade: bool | None = None,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
     terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
     terrain_radial_noise_amplitude: float = DEFAULT_RADIAL_NOISE_AMPLITUDE,
+    seamless_tile_edges: bool = True,
 ) -> FilmScene:
     """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
@@ -314,8 +408,29 @@ def build_scene(
             np.zeros(len(points), dtype=np.float64),
         ]
     )
+    if terrain and seamless_tile_edges:
+        vertical = (points[:, 0] == 0.0) | (points[:, 0] == 1.0)
+        horizontal = (points[:, 1] == 0.0) | (points[:, 1] == 1.0)
+        vertical_wave = (
+            0.55 * np.sin(2.0 * np.pi * (11.0 * points[:, 1] + 0.1931))
+            + 0.45 * np.sin(2.0 * np.pi * (17.0 * points[:, 1] + 0.4198))
+        )
+        horizontal_wave = (
+            0.55 * np.sin(2.0 * np.pi * (13.0 * points[:, 0] + 0.4198))
+            + 0.45 * np.sin(2.0 * np.pi * (19.0 * points[:, 0] + 0.1931))
+        )
+        points_world[vertical, 0] += (
+            TILE_JOIN_JITTER_FRACTION
+            * FRAME_ASPECT_RATIO
+            * vertical_wave[vertical]
+        )
+        points_world[horizontal, 1] += (
+            TILE_JOIN_JITTER_FRACTION * horizontal_wave[horizontal]
+        )
     terrain_max_height_world = 0.0
     terrain_max_height_metres = 0.0
+    if terrain_shade is None:
+        terrain_shade = terrain
     if terrain_shade and not terrain:
         raise ValueError("Terrain shading requires terrain geometry")
     if terrain:
@@ -367,10 +482,18 @@ def build_scene(
     land_spectra = base_spectra[
         rng.choice(land_indices, size=len(simplices), replace=True)
     ]
+    if terrain and seamless_tile_edges:
+        final_spectra, land_spectra = _match_opposite_tile_edges(
+            points,
+            simplices,
+            classes,
+            final_spectra,
+            land_spectra,
+        )
+        identity_spectra = final_spectra.copy()
+        identity_spectra[classes == 1] = base_spectra[classes == 1]
     triangle_centroids_world = points_world[simplices].mean(axis=1)
-    minimum = points_world[:, :2].min(axis=0)
-    maximum = points_world[:, :2].max(axis=0)
-    tile_width, tile_height = maximum - minimum
+    tile_width, tile_height = FRAME_ASPECT_RATIO, 1.0
     max_x_tiles = int(math.ceil(EXTENDED_PLANE_HALF_SIZE / tile_width)) + 1
     max_y_tiles = int(math.ceil(EXTENDED_PLANE_HALF_SIZE / tile_height)) + 1
     tile_offsets = np.array(
@@ -383,6 +506,23 @@ def build_scene(
     )
     healthy_indices = np.unique(simplices[np.isin(classes, (1, 2))].ravel())
     healthy_points_world = points_world[healthy_indices]
+    source_boundary_world = tuple(
+        points_world[indices]
+        for indices in (
+            np.flatnonzero(points[:, 0] == 0.0)[
+                np.argsort(points[points[:, 0] == 0.0, 1])
+            ],
+            np.flatnonzero(points[:, 0] == 1.0)[
+                np.argsort(points[points[:, 0] == 1.0, 1])
+            ],
+            np.flatnonzero(points[:, 1] == 0.0)[
+                np.argsort(points[points[:, 1] == 0.0, 0])
+            ],
+            np.flatnonzero(points[:, 1] == 1.0)[
+                np.argsort(points[points[:, 1] == 1.0, 0])
+            ],
+        )
+    )
     return FilmScene(
         points_world=points_world,
         simplices=simplices,
@@ -410,6 +550,8 @@ def build_scene(
         terrain_shade_strength=float(shade_strength),
         facet_shades=facet_shades,
         baked_hillshade_enabled=baked_hillshade_enabled,
+        seamless_tile_edges=bool(seamless_tile_edges),
+        source_boundary_world=source_boundary_world,
     )
 
 
@@ -1365,7 +1507,7 @@ def render_final_film(
     seed: int = SEED,
     *,
     terrain: bool = False,
-    exaggeration: float = 2.0,
+    exaggeration: float = DEFAULT_EXAGGERATION,
 ) -> dict:
     """Render the approved 4K delivery, 10-bit master, and upload copy."""
     FILM_DIR.mkdir(parents=True, exist_ok=True)
@@ -1607,10 +1749,11 @@ def _terrain_identity_checks(
 def source_tile_edge_luminance_check(
     scene: FilmScene,
     *,
-    size: tuple[int, int] = (640, 360),
-    band_pixels: int = 6,
+    size: tuple[int, int] = (1920, 1080),
+    line_pixels: int = 2,
+    reference_offset_pixels: int = 8,
 ) -> dict:
-    """Compare mean daylight luminance just inside/outside the source tile."""
+    """Measure visible contrast on the repeated source-tile join."""
     frame, _ = render_camera_frame(
         scene,
         0.0,
@@ -1619,58 +1762,110 @@ def source_tile_edge_luminance_check(
         mixture_override=0.0,
     )
     camera = camera_state(scene, 0.0, size)
-    projected, _ = _project(
-        scene.points_world,
-        camera.tilt_degrees,
-        camera.heading_degrees,
-        camera.distance,
-        size,
-        camera.screen_shift_fraction,
-    )
-    x0, y0 = np.ceil(projected.min(axis=0)).astype(int)
-    x1, y1 = np.floor(projected.max(axis=0)).astype(int)
-    band = int(band_pixels)
-    trim = band * 2
+    line = int(line_pixels)
+    offset = int(reference_offset_pixels)
+    if line != 2 or offset < line:
+        raise ValueError("Seam check requires a 2 px line and wider offset")
+    projected_boundaries = [
+        _project(
+            boundary,
+            camera.tilt_degrees,
+            camera.heading_degrees,
+            camera.distance,
+            size,
+            camera.screen_shift_fraction,
+        )[0]
+        for boundary in scene.source_boundary_world
+    ]
+    all_projected = np.vstack(projected_boundaries)
+    x0, y0 = np.floor(all_projected.min(axis=0)).astype(int)
+    x1, y1 = np.ceil(all_projected.max(axis=0)).astype(int)
     if (
-        x0 < band
-        or y0 < band
-        or x1 + band >= size[0]
-        or y1 + band >= size[1]
+        x0 < offset + line
+        or y0 < offset + line
+        or x1 + offset + line >= size[0]
+        or y1 + offset + line >= size[1]
     ):
-        raise RuntimeError("Source tile edge bands are outside the render frame")
+        raise RuntimeError("Source tile seam lines are outside the render frame")
     luminance = frame.astype(np.float64) @ np.array(
         [0.2126, 0.7152, 0.0722]
     )
-    outside = np.concatenate(
-        [
-            luminance[y0 + trim : y1 - trim, x0 - band : x0].ravel(),
-            luminance[y0 + trim : y1 - trim, x1 + 1 : x1 + 1 + band].ravel(),
-            luminance[y0 - band : y0, x0 + trim : x1 - trim].ravel(),
-            luminance[y1 + 1 : y1 + 1 + band, x0 + trim : x1 - trim].ravel(),
-        ]
-    )
-    inside = np.concatenate(
-        [
-            luminance[y0 + trim : y1 - trim, x0 : x0 + band].ravel(),
-            luminance[y0 + trim : y1 - trim, x1 + 1 - band : x1 + 1].ravel(),
-            luminance[y0 : y0 + band, x0 + trim : x1 - trim].ravel(),
-            luminance[y1 + 1 - band : y1 + 1, x0 + trim : x1 - trim].ravel(),
-        ]
-    )
-    outside_mean = float(np.mean(outside))
-    inside_mean = float(np.mean(inside))
-    relative_difference = abs(outside_mean - inside_mean) / max(
-        (outside_mean + inside_mean) / 2.0,
+    high_pass = np.abs(luminance - gaussian_filter(luminance, sigma=2.0))
+    boundary_coordinates = []
+    reference_coordinates = []
+    for polyline in projected_boundaries:
+        # Omit two end segments so corner overlaps cannot dominate the tail.
+        for start, end in zip(polyline[2:-3], polyline[3:-2]):
+            direction = end - start
+            length = float(np.linalg.norm(direction))
+            if length <= 1.0:
+                continue
+            normal = np.array([-direction[1], direction[0]]) / length
+            sample_count = max(1, int(math.floor(length)))
+            progress = (np.arange(sample_count) + 0.5) / sample_count
+            centers = start + progress[:, None] * direction
+            for displacement in (-0.5, 0.5):
+                boundary_coordinates.append(centers + displacement * normal)
+            for displacement in (
+                -offset - 0.5,
+                -offset + 0.5,
+                offset - 0.5,
+                offset + 0.5,
+            ):
+                reference_coordinates.append(centers + displacement * normal)
+    boundary_xy = np.vstack(boundary_coordinates)
+    reference_xy = np.vstack(reference_coordinates)
+
+    def sample(array: np.ndarray, coordinates: np.ndarray) -> np.ndarray:
+        return map_coordinates(
+            array,
+            np.vstack([coordinates[:, 1], coordinates[:, 0]]),
+            order=1,
+            mode="nearest",
+            prefilter=False,
+        )
+
+    boundary = sample(luminance, boundary_xy)
+    reference = sample(luminance, reference_xy)
+    boundary_high_pass = sample(high_pass, boundary_xy)
+    reference_high_pass = sample(high_pass, reference_xy)
+    boundary_mean = float(np.mean(boundary))
+    reference_mean = float(np.mean(reference))
+    normalizer = max(
+        (boundary_mean + reference_mean) / 2.0,
         np.finfo(np.float64).eps,
     )
+    mean_relative_difference = abs(boundary_mean - reference_mean) / normalizer
+    boundary_high_pass_p99 = float(np.percentile(boundary_high_pass, 99.0))
+    reference_high_pass_p99 = float(np.percentile(reference_high_pass, 99.0))
+    high_pass_p99_absolute_relative_difference = (
+        abs(boundary_high_pass_p99 - reference_high_pass_p99) / normalizer
+    )
+    high_pass_p99_relative_difference = (
+        high_pass_p99_absolute_relative_difference
+    )
+    limit = 0.005
     return {
-        "band_pixels": band,
+        "line_pixels": line,
+        "reference_offset_pixels": offset,
         "source_bounds_px": [int(x0), int(y0), int(x1), int(y1)],
-        "outside_mean_luminance": outside_mean,
-        "inside_mean_luminance": inside_mean,
-        "relative_difference": float(relative_difference),
-        "limit": 0.01,
-        "passes": bool(relative_difference < 0.01),
+        "boundary_mean_luminance": boundary_mean,
+        "reference_mean_luminance": reference_mean,
+        "mean_relative_difference": float(mean_relative_difference),
+        "boundary_high_pass_p99": boundary_high_pass_p99,
+        "reference_high_pass_p99": reference_high_pass_p99,
+        "high_pass_p99_relative_difference": float(
+            high_pass_p99_relative_difference
+        ),
+        "high_pass_p99_absolute_relative_difference": float(
+            high_pass_p99_absolute_relative_difference
+        ),
+        "relative_difference": float(mean_relative_difference),
+        "limit": limit,
+        "passes": bool(
+            mean_relative_difference < limit
+            and high_pass_p99_relative_difference < limit
+        ),
     }
 
 
@@ -1907,139 +2102,84 @@ def render_terrain_shade_preview(
 def render_terrain_preview(
     seed: int = SEED,
     *,
-    exaggeration: float = 2.0,
+    exaggeration: float = DEFAULT_EXAGGERATION,
+    terrain_shade: bool = True,
+    shade_strength: float = DEFAULT_SHADE_STRENGTH,
     terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
+    terrain_radial_noise_amplitude: float = DEFAULT_RADIAL_NOISE_AMPLITUDE,
 ) -> dict:
-    """Render the requested still-only terrain comparison; never the final film."""
+    """Render the locked 40-second terrain orbit preview and opening still."""
     TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    flat_scene = build_scene(seed)
     terrain_scene = build_scene(
         seed,
         terrain=True,
         exaggeration=exaggeration,
+        terrain_shade=terrain_shade,
+        shade_strength=shade_strength,
         terrain_smoothing_metres=terrain_smoothing_metres,
+        terrain_radial_noise_amplitude=terrain_radial_noise_amplitude,
     )
-    rows = []
-    timing = {"terrain_off_seconds": [], "terrain_on_seconds": []}
-    corners = []
-    outputs: dict[str, str] = {}
-    for seconds in TERRAIN_PREVIEW_TIMES:
-        flat, flat_metadata = render_camera_frame(
-            flat_scene,
-            seconds,
-            TERRAIN_PREVIEW_SIZE,
-            apply_fade=False,
-        )
-        terrain_frame, terrain_metadata = render_camera_frame(
-            terrain_scene,
-            seconds,
-            TERRAIN_PREVIEW_SIZE,
-            apply_fade=False,
-        )
-        stem = f"{int(seconds):03d}s"
-        flat_path = TERRAIN_PREVIEW_DIR / f"{stem}_terrain_off.png"
-        terrain_path = TERRAIN_PREVIEW_DIR / f"{stem}_terrain_on.png"
-        Image.fromarray(flat).save(flat_path, optimize=True)
-        Image.fromarray(terrain_frame).save(terrain_path, optimize=True)
-        rows.append(
-            (
-                seconds,
-                Image.fromarray(flat),
-                Image.fromarray(terrain_frame),
-            )
-        )
-        timing["terrain_off_seconds"].append(flat_metadata["render_seconds"])
-        timing["terrain_on_seconds"].append(
-            terrain_metadata["render_seconds"]
-        )
-        corners.append(
-            {
-                "seconds": seconds,
-                "background_pixels_by_corner": terrain_metadata[
-                    "corner_background_pixels"
-                ],
-            }
-        )
-        outputs[f"{stem}_terrain_off"] = str(flat_path.relative_to(DATA_DIR.parent))
-        outputs[f"{stem}_terrain_on"] = str(
-            terrain_path.relative_to(DATA_DIR.parent)
-        )
-
-    contact_path = TERRAIN_PREVIEW_DIR / "terrain_on_off_contact_sheet.png"
-    _contact_sheet(rows, contact_path)
-    outputs["contact_sheet"] = str(contact_path.relative_to(DATA_DIR.parent))
-
-    sweep_images = []
-    sweep_rows = []
-    for value in (1.0, 2.0, 3.0):
-        sweep_scene = build_scene(
-            seed,
-            terrain=True,
-            exaggeration=value,
-            terrain_smoothing_metres=terrain_smoothing_metres,
-        )
-        frame, metadata = render_camera_frame(
-            sweep_scene,
-            105.0,
-            TERRAIN_PREVIEW_SIZE,
-            apply_fade=False,
-        )
-        path = TERRAIN_PREVIEW_DIR / f"105s_exaggeration_{value:.1f}x.png"
-        Image.fromarray(frame).save(path, optimize=True)
-        sweep_images.append(Image.fromarray(frame))
-        sweep_rows.append(
-            {
-                "exaggeration": value,
-                "max_height_metres_exaggerated": (
-                    sweep_scene.terrain_max_height_metres
-                ),
-                "render_seconds": metadata["render_seconds"],
-                "path": str(path.relative_to(DATA_DIR.parent)),
-            }
-        )
-    sweep_width = 1_600
-    sweep_height = 300
-    label_height = 42
-    widths = (534, 533, 533)
-    sweep_sheet = Image.new(
-        "RGB", (sweep_width, sweep_height + label_height), (24, 24, 24)
+    old_scene = build_scene(
+        seed,
+        terrain=True,
+        exaggeration=exaggeration,
+        terrain_shade=terrain_shade,
+        shade_strength=shade_strength,
+        terrain_smoothing_metres=terrain_smoothing_metres,
+        terrain_radial_noise_amplitude=terrain_radial_noise_amplitude,
+        seamless_tile_edges=False,
     )
-    sweep_draw = ImageDraw.Draw(sweep_sheet)
-    x = 0
-    for image, width, value in zip(sweep_images, widths, (1.0, 2.0, 3.0)):
-        sweep_sheet.paste(
-            image.resize((width, sweep_height), Image.Resampling.LANCZOS),
-            (x, label_height),
-        )
-        sweep_draw.text(
-            (x + 16, 8),
-            f"1:45 · relief exaggerated ×{value:.0f}",
-            font=_font(23),
-            fill=(220, 220, 220),
-        )
-        x += width
-    sweep_path = TERRAIN_PREVIEW_DIR / "105s_exaggeration_sweep.png"
-    sweep_sheet.save(sweep_path, optimize=True)
-    outputs["exaggeration_sweep"] = str(sweep_path.relative_to(DATA_DIR.parent))
+    seam_old = source_tile_edge_luminance_check(old_scene)
+    seam_new = source_tile_edge_luminance_check(terrain_scene)
+    if not seam_new["passes"]:
+        raise RuntimeError(f"Source-tile seam check failed: {seam_new}")
 
+    opening, opening_metadata = render_camera_frame(
+        terrain_scene,
+        0.0,
+        (1920, 1080),
+        apply_fade=False,
+        mixture_override=0.0,
+    )
+    Image.fromarray(opening).save(TERRAIN_OPENING_STILL_PATH, optimize=True)
+    global_times = TERRAIN_ORBIT_START_SECONDS + np.arange(
+        int(round(TERRAIN_ORBIT_DURATION_SECONDS * FPS))
+    ) / FPS
+    rows, wall_seconds = _encode_times(
+        terrain_scene,
+        TERRAIN_ORBIT_PATH,
+        TERRAIN_ORBIT_SIZE,
+        global_times,
+    )
     identity = _terrain_identity_checks(terrain_scene)
-    flat_median = float(np.median(timing["terrain_off_seconds"]))
-    terrain_median = float(np.median(timing["terrain_on_seconds"]))
     report = {
         "seed": seed,
         "preview_only": True,
         "terrain": {
             "enabled": True,
             "exaggeration": exaggeration,
+            "smoothing_metres": terrain_smoothing_metres,
+            "shade_enabled": terrain_shade,
+            "shade_strength": shade_strength,
+            "falloff_noise_amplitude": terrain_radial_noise_amplitude,
             "max_vertex_height_world": terrain_scene.terrain_max_height_world,
             "max_vertex_height_metres_exaggerated": (
                 terrain_scene.terrain_max_height_metres
             ),
-            "shading": (
-                "existing baked 315-degree/45-degree hillshade; geometry is "
-                "unlit to avoid double-counting illumination"
-            ),
+            "shading": "per-facet Lambert scalar; baked hillshade disabled",
             "occlusion": "global back-to-front sorting of all visible facets",
+        },
+        "seam_check": {
+            "cause": (
+                "collinear repeated-mesh boundary facets plus differing "
+                "palettes on an inclusive coplanar polygon edge"
+            ),
+            "fix": (
+                "deterministic periodic boundary jitter shared by adjacent "
+                "tiles, plus a 20% paired-facet spectrum match"
+            ),
+            "old": seam_old,
+            "new": seam_new,
         },
         "d65_identity": {
             "samples": identity,
@@ -2050,24 +2190,28 @@ def render_terrain_preview(
                 row["max_pixel_difference"] == 0 for row in identity
             ),
         },
-        "corner_check": {
-            "samples": corners,
-            "passes": all(
-                not any(row["background_pixels_by_corner"])
-                for row in corners
+        "orbit_preview": {
+            "global_seconds": [
+                TERRAIN_ORBIT_START_SECONDS,
+                TERRAIN_ORBIT_START_SECONDS + TERRAIN_ORBIT_DURATION_SECONDS,
+            ],
+            "size": list(TERRAIN_ORBIT_SIZE),
+            "fps": FPS,
+            "frame_count": len(rows),
+            "wall_seconds": wall_seconds,
+            "timing": _summarise_timing(rows),
+            "probe": _probe(TERRAIN_ORBIT_PATH),
+            "path": str(TERRAIN_ORBIT_PATH.relative_to(DATA_DIR.parent)),
+        },
+        "opening_still": {
+            "size": [1920, 1080],
+            "render_seconds": opening_metadata["render_seconds"],
+            "path": str(
+                TERRAIN_OPENING_STILL_PATH.relative_to(DATA_DIR.parent)
             ),
         },
-        "render_timing": {
-            "size": list(TERRAIN_PREVIEW_SIZE),
-            "terrain_off_median_seconds_per_frame": flat_median,
-            "terrain_on_median_seconds_per_frame": terrain_median,
-            "change_seconds_per_frame": terrain_median - flat_median,
-            "ratio": terrain_median / flat_median,
-        },
-        "exaggeration_sweep": sweep_rows,
-        "outputs": outputs,
     }
-    TERRAIN_PREVIEW_REPORT_PATH.write_text(
+    TERRAIN_LOCKED_REPORT_PATH.write_text(
         json.dumps(report, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -2078,25 +2222,22 @@ def render_phase4_preview(
     seed: int = SEED,
     *,
     terrain: bool = False,
-    exaggeration: float = 2.0,
-    terrain_shade: bool = False,
+    exaggeration: float = DEFAULT_EXAGGERATION,
+    terrain_shade: bool | None = None,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
     terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> dict:
     """Render the orbit shimmer clip and the four-times-speed full-film preview."""
-    if terrain_shade:
-        if not terrain:
-            raise ValueError("--terrain-shade requires --terrain")
-        return render_terrain_shade_preview(
-            seed,
-            shade_strength=shade_strength,
-            terrain_smoothing_metres=terrain_smoothing_metres,
-        )
+    if terrain_shade and not terrain:
+        raise ValueError("--terrain-shade requires --terrain")
     if terrain:
         return render_terrain_preview(
             seed,
             exaggeration=exaggeration,
+            terrain_shade=True if terrain_shade is None else terrain_shade,
+            shade_strength=shade_strength,
             terrain_smoothing_metres=terrain_smoothing_metres,
+            terrain_radial_noise_amplitude=DEFAULT_RADIAL_NOISE_AMPLITUDE,
         )
     FILM_DIR.mkdir(parents=True, exist_ok=True)
     SHIMMER_DIR.mkdir(parents=True, exist_ok=True)
