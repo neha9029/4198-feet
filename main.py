@@ -61,8 +61,8 @@ def main() -> None:
     parser.add_argument(
         "--terrain-smoothing",
         type=float,
-        default=300.0,
-        help="3D terrain DEM smoothing in metres (default: 300)",
+        default=600.0,
+        help="3D terrain DEM smoothing in metres (default: 600)",
     )
     args = parser.parse_args()
     if args.phase == "phase1":

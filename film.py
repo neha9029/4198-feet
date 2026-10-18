@@ -34,10 +34,11 @@ from metamers import (
 )
 from relief import RELIEF_FACTORS_PATH
 from terrain import (
+    DEFAULT_RADIAL_NOISE_AMPLITUDE,
     DEFAULT_SHADE_STRENGTH,
     DEFAULT_TERRAIN_SMOOTHING_METRES,
-    RADIAL_FULL_RADIUS,
-    RADIAL_ZERO_RADIUS,
+    RADIAL_INNER_FRACTION,
+    RADIAL_TILE_MARGIN_FRACTION,
 )
 
 
@@ -111,7 +112,7 @@ TERRAIN_PREVIEW_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_report.json"
 TERRAIN_PREVIEW_TIMES = (0.0, 60.0, 105.0, 150.0, 180.0)
 TERRAIN_PREVIEW_SIZE = (1600, 900)
 TERRAIN_SHADE_EXAGGERATION = 4.0
-TERRAIN_SMOOTHING_SWEEP = (300.0, 600.0, 800.0)
+TERRAIN_FALLOFF_NOISE_COMPARISON = (DEFAULT_RADIAL_NOISE_AMPLITUDE, 0.0)
 TERRAIN_SHADE_REPORT_PATH = TERRAIN_PREVIEW_DIR / "terrain_shade_report.json"
 
 
@@ -146,6 +147,7 @@ class FilmScene:
     terrain_max_height_world: float
     terrain_max_height_metres: float
     terrain_smoothing_metres: float
+    terrain_radial_noise_amplitude: float
     terrain_shade_enabled: bool
     terrain_shade_strength: float
     facet_shades: np.ndarray
@@ -289,6 +291,7 @@ def build_scene(
     terrain_shade: bool = False,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
     terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
+    terrain_radial_noise_amplitude: float = DEFAULT_RADIAL_NOISE_AMPLITUDE,
 ) -> FilmScene:
     """Load production spectra and construct a full-density tiled land plane."""
     mesh = np.load(MESH_PATH)
@@ -322,6 +325,8 @@ def build_scene(
             points,
             exaggeration=exaggeration,
             smoothing_metres=terrain_smoothing_metres,
+            radial_noise_amplitude=terrain_radial_noise_amplitude,
+            seed=seed,
         )
         points_world[:, 2] = terrain_geometry.heights_world
         terrain_max_height_world = terrain_geometry.max_height_world
@@ -398,6 +403,9 @@ def build_scene(
         terrain_max_height_world=terrain_max_height_world,
         terrain_max_height_metres=terrain_max_height_metres,
         terrain_smoothing_metres=float(terrain_smoothing_metres),
+        terrain_radial_noise_amplitude=float(
+            terrain_radial_noise_amplitude
+        ),
         terrain_shade_enabled=bool(terrain_shade),
         terrain_shade_strength=float(shade_strength),
         facet_shades=facet_shades,
@@ -1707,25 +1715,28 @@ def render_terrain_shade_preview(
     seed: int = SEED,
     *,
     shade_strength: float = DEFAULT_SHADE_STRENGTH,
+    terrain_smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
 ) -> dict:
-    """Render only the experimental radial/smoothing terrain still sweep."""
+    """Render the broad noisy falloff beside its zero-noise control."""
     TERRAIN_PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
     sweep_rows = []
     scenes: dict[float, FilmScene] = {}
     frames: dict[tuple[float, float], Image.Image] = {}
     identity_rows = []
-    for smoothing_metres in TERRAIN_SMOOTHING_SWEEP:
+    for noise_amplitude in TERRAIN_FALLOFF_NOISE_COMPARISON:
         scene = build_scene(
             seed,
             terrain=True,
             exaggeration=TERRAIN_SHADE_EXAGGERATION,
             terrain_shade=True,
             shade_strength=shade_strength,
-            terrain_smoothing_metres=smoothing_metres,
+            terrain_smoothing_metres=terrain_smoothing_metres,
+            terrain_radial_noise_amplitude=noise_amplitude,
         )
-        scenes[smoothing_metres] = scene
+        scenes[noise_amplitude] = scene
         row = {
-            "smoothing_metres": smoothing_metres,
+            "noise_amplitude_fraction": noise_amplitude,
+            "smoothing_metres": terrain_smoothing_metres,
             "exaggeration": TERRAIN_SHADE_EXAGGERATION,
             "shade_strength": shade_strength,
             "shade_min_max": [
@@ -1743,17 +1754,20 @@ def render_terrain_shade_preview(
             )
             path = (
                 TERRAIN_PREVIEW_DIR
-                / f"{label}_radial_smoothing_{int(smoothing_metres)}m.png"
+                / (
+                    f"{label}_falloff_noise_"
+                    f"{int(round(noise_amplitude * 100)):02d}pct.png"
+                )
             )
             Image.fromarray(frame).save(path, optimize=True)
-            frames[(smoothing_metres, seconds)] = Image.fromarray(frame)
+            frames[(noise_amplitude, seconds)] = Image.fromarray(frame)
             row["frames"][label] = {
                 "render_seconds": metadata["render_seconds"],
                 "path": str(path.relative_to(DATA_DIR.parent)),
             }
         identity_rows.append(
             {
-                "smoothing_metres": smoothing_metres,
+                "noise_amplitude_fraction": noise_amplitude,
                 "samples": _terrain_identity_checks(scene),
             }
         )
@@ -1768,19 +1782,22 @@ def render_terrain_shade_preview(
         "RGB",
         (
             contact_width,
-            len(TERRAIN_SMOOTHING_SWEEP) * (image_height + label_height),
+            len(TERRAIN_FALLOFF_NOISE_COMPARISON)
+            * (image_height + label_height),
         ),
         (24, 24, 24),
     )
     draw = ImageDraw.Draw(sheet)
     font = _font(22)
-    for row_index, smoothing_metres in enumerate(TERRAIN_SMOOTHING_SWEEP):
+    for row_index, noise_amplitude in enumerate(
+        TERRAIN_FALLOFF_NOISE_COMPARISON
+    ):
         y = row_index * (image_height + label_height)
         for column_index, (seconds, time_label) in enumerate(
             ((105.0, "1:45"), (0.0, "0:00 daylight"))
         ):
             x = column_index * panel_width
-            image = frames[(smoothing_metres, seconds)].resize(
+            image = frames[(noise_amplitude, seconds)].resize(
                 (panel_width, image_height),
                 Image.Resampling.LANCZOS,
             )
@@ -1788,13 +1805,13 @@ def render_terrain_shade_preview(
             draw.text(
                 (x + 16, y + 8),
                 (
-                    f"{int(smoothing_metres)} m · {time_label} · "
+                    f"noise {noise_amplitude:.0%} · {time_label} · "
                     f"×{TERRAIN_SHADE_EXAGGERATION:.0f} · s={shade_strength:.1f}"
                 ),
                 font=font,
                 fill=(220, 220, 220),
             )
-    contact_path = TERRAIN_PREVIEW_DIR / "radial_sweep.png"
+    contact_path = TERRAIN_PREVIEW_DIR / "falloff_v2.png"
     sheet.save(contact_path, optimize=True)
 
     identity_max = max(
@@ -1804,11 +1821,11 @@ def render_terrain_shade_preview(
     )
     class_shades = {
         str(class_value): [
-            float(scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].facet_shades[
-                scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].classes == class_value
+            float(scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].facet_shades[
+                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
             ].min()),
-            float(scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].facet_shades[
-                scenes[DEFAULT_TERRAIN_SMOOTHING_METRES].classes == class_value
+            float(scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].facet_shades[
+                scenes[DEFAULT_RADIAL_NOISE_AMPLITUDE].classes == class_value
             ].max()),
         ]
         for class_value in (1, 2, 3)
@@ -1832,26 +1849,48 @@ def render_terrain_shade_preview(
         },
         "radial_falloff": {
             "coordinate_system": (
-                "distance from area-weighted healthy-lake centroid, scaled "
-                "by the 16:9 frame half-extents"
+                "largest centroid-centred ellipse inside the source tile's "
+                "three-percent inset"
             ),
-            "full_height_radius": RADIAL_FULL_RADIUS,
-            "zero_height_radius": RADIAL_ZERO_RADIUS,
+            "tile_margin_fraction": RADIAL_TILE_MARGIN_FRACTION,
+            "full_height_fraction_of_local_radius": RADIAL_INNER_FRACTION,
+            "zero_height_nominal_radius": 1.0,
+            "noise": (
+                "seeded two-/three-lobe angular perturbation, capped by "
+                "the three-percent inset boundary"
+            ),
+            "noise_amplitude_fraction": DEFAULT_RADIAL_NOISE_AMPLITUDE,
+            "applied_to": "height multiplier using smootherstep",
         },
         "d65_identity": {
-            "by_smoothing": identity_rows,
+            "by_noise_amplitude": identity_rows,
             "max_pixel_difference": identity_max,
             "passes": identity_max == 0,
         },
         "edge_luminance": {
             "terrain_off": flat_edge_check,
-            "terrain_shade_by_smoothing": [
+            "terrain_shade_by_noise_amplitude": [
                 {
-                    "smoothing_metres": row["smoothing_metres"],
+                    "noise_amplitude_fraction": row[
+                        "noise_amplitude_fraction"
+                    ],
                     **row["edge_luminance"],
                 }
                 for row in sweep_rows
             ],
+            "previous_commit": {
+                "terrain_off_relative_difference": 0.002439001270626769,
+                "terrain_shade_300m_relative_difference": (
+                    0.0011049387903049254
+                ),
+                "terrain_shade_600m_relative_difference": (
+                    0.0012586301659322733
+                ),
+                "terrain_shade_800m_relative_difference": (
+                    0.0016403880147584054
+                ),
+                "limit": 0.01,
+            },
         },
         "sweep": sweep_rows,
         "outputs": {
@@ -2051,6 +2090,7 @@ def render_phase4_preview(
         return render_terrain_shade_preview(
             seed,
             shade_strength=shade_strength,
+            terrain_smoothing_metres=terrain_smoothing_metres,
         )
     if terrain:
         return render_terrain_preview(

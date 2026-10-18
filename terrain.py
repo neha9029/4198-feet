@@ -8,7 +8,7 @@ import numpy as np
 import rasterio
 from scipy import ndimage
 
-from data import DATA_DIR
+from data import DATA_DIR, SEED
 from mesh import MESH_PATH
 from relief import (
     DEM_PATH,
@@ -23,9 +23,10 @@ DEFAULT_EXAGGERATION = 2.0
 SHORELINE_RAMP_METRES = 1_000.0
 PIXEL_SIZE_METRES = 30.0
 DEFAULT_SHADE_STRENGTH = 0.6
-DEFAULT_TERRAIN_SMOOTHING_METRES = 300.0
-RADIAL_FULL_RADIUS = 0.78
-RADIAL_ZERO_RADIUS = 0.90
+DEFAULT_TERRAIN_SMOOTHING_METRES = 600.0
+RADIAL_TILE_MARGIN_FRACTION = 0.03
+RADIAL_INNER_FRACTION = 0.45
+DEFAULT_RADIAL_NOISE_AMPLITUDE = 0.12
 
 
 @dataclass(frozen=True)
@@ -37,9 +38,12 @@ class TerrainGeometry:
     flat_vertex_mask: np.ndarray
     radial_falloff: np.ndarray
     radial_distance: np.ndarray
+    radial_outer_radius: np.ndarray
     healthy_centroid: np.ndarray
+    radial_semiaxes: np.ndarray
     radial_full_radius: float
     radial_zero_radius: float
+    radial_noise_amplitude: float
     shoreline_ramp: np.ndarray
     frame_height_metres: float
     exaggeration: float
@@ -100,6 +104,80 @@ def _smootherstep(values: np.ndarray) -> np.ndarray:
     )
 
 
+def _radial_falloff(
+    points: np.ndarray,
+    centroid: np.ndarray,
+    *,
+    seed: int,
+    noise_amplitude: float,
+    tile_margin_fraction: float = RADIAL_TILE_MARGIN_FRACTION,
+    inner_fraction: float = RADIAL_INNER_FRACTION,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return a broad, lobed elliptical height multiplier.
+
+    Radius 1 is the largest centroid-centred, axis-aligned ellipse inside the
+    source tile's three-percent inset. A seeded mix of two- and three-lobe
+    waves perturbs that radius, while an exact per-angle rectangle limit keeps
+    every lobe inside the inset boundary.
+    """
+    if not 0.0 <= noise_amplitude < 1.0:
+        raise ValueError("Terrain radial noise amplitude must be within [0, 1)")
+    if not 0.0 < tile_margin_fraction < 0.5:
+        raise ValueError("Terrain tile margin must be within (0, 0.5)")
+    if not 0.0 < inner_fraction < 1.0:
+        raise ValueError("Terrain radial inner fraction must be within (0, 1)")
+
+    lower = tile_margin_fraction
+    upper = 1.0 - tile_margin_fraction
+    semiaxes = np.array(
+        [
+            min(centroid[0] - lower, upper - centroid[0]),
+            min(centroid[1] - lower, upper - centroid[1]),
+        ],
+        dtype=np.float64,
+    )
+    if np.any(semiaxes <= 0.0):
+        raise ValueError("Healthy-lake centroid lies outside terrain fade inset")
+
+    normalized = (points - centroid) / semiaxes
+    radial_distance = np.linalg.norm(normalized, axis=1)
+    angles = np.arctan2(normalized[:, 1], normalized[:, 0])
+    cos_angle = np.cos(angles)
+    sin_angle = np.sin(angles)
+
+    # Exact ray-to-inset-rectangle limit in ellipse-radius units. This cap is
+    # important where a positive lobe would otherwise approach a tile edge.
+    tiny = np.finfo(np.float64).eps
+    x_limit = np.where(
+        cos_angle >= 0.0,
+        (upper - centroid[0]) / np.maximum(semiaxes[0] * cos_angle, tiny),
+        (centroid[0] - lower) / np.maximum(-semiaxes[0] * cos_angle, tiny),
+    )
+    y_limit = np.where(
+        sin_angle >= 0.0,
+        (upper - centroid[1]) / np.maximum(semiaxes[1] * sin_angle, tiny),
+        (centroid[1] - lower) / np.maximum(-semiaxes[1] * sin_angle, tiny),
+    )
+    inset_boundary_radius = np.minimum(x_limit, y_limit)
+
+    rng = np.random.default_rng(seed + 4_198)
+    phase_two, phase_three = rng.uniform(0.0, 2.0 * np.pi, size=2)
+    low_frequency_noise = (
+        0.58 * np.cos(2.0 * angles + phase_two)
+        + 0.42 * np.cos(3.0 * angles + phase_three)
+    )
+    perturbed_radius = 1.0 + noise_amplitude * low_frequency_noise
+    outer_radius = np.minimum(perturbed_radius, inset_boundary_radius)
+    inner_radius = inner_fraction * outer_radius
+    progress = (radial_distance - inner_radius) / (
+        outer_radius - inner_radius
+    )
+    falloff = 1.0 - _smootherstep(progress)
+    falloff[radial_distance >= outer_radius] = 0.0
+    falloff[radial_distance <= inner_radius] = 1.0
+    return falloff, radial_distance, outer_radius, semiaxes
+
+
 def _film_class_raster() -> np.ndarray:
     """Reconstruct the north-up 16:9 class frame stored by ``mesh.py``."""
     mesh = np.load(MESH_PATH)
@@ -141,8 +219,8 @@ def build_vertex_terrain(
     exaggeration: float = DEFAULT_EXAGGERATION,
     smoothing_metres: float = DEFAULT_TERRAIN_SMOOTHING_METRES,
     shoreline_ramp_metres: float = SHORELINE_RAMP_METRES,
-    radial_full_radius: float = RADIAL_FULL_RADIUS,
-    radial_zero_radius: float = RADIAL_ZERO_RADIUS,
+    radial_noise_amplitude: float = DEFAULT_RADIAL_NOISE_AMPLITUDE,
+    seed: int = SEED,
 ) -> TerrainGeometry:
     """Sample the DEM and return deterministic film-space vertex heights.
 
@@ -154,8 +232,6 @@ def build_vertex_terrain(
         raise ValueError("Terrain exaggeration must be non-negative")
     if shoreline_ramp_metres <= 0.0 or smoothing_metres <= 0.0:
         raise ValueError("Terrain smoothing and shoreline ramp must be positive")
-    if not 0.0 < radial_full_radius < radial_zero_radius:
-        raise ValueError("Terrain radial radii must satisfy 0 < r0 < r1")
 
     with rasterio.open(DEM_PATH) as dataset:
         elevation = dataset.read(1).astype(np.float32)
@@ -208,17 +284,17 @@ def build_vertex_terrain(
         axis=0,
         weights=triangle_areas[healthy_triangles],
     )
-    radial_distance = np.sqrt(
-        ((points[:, 0] - healthy_centroid[0]) / 0.5) ** 2
-        + ((points[:, 1] - healthy_centroid[1]) / 0.5) ** 2
+    (
+        radial_falloff,
+        radial_distance,
+        radial_outer_radius,
+        radial_semiaxes,
+    ) = _radial_falloff(
+        points,
+        healthy_centroid,
+        seed=seed,
+        noise_amplitude=radial_noise_amplitude,
     )
-    radial_progress = (
-        (radial_distance - radial_full_radius)
-        / (radial_zero_radius - radial_full_radius)
-    )
-    radial_falloff = 1.0 - _smootherstep(radial_progress)
-    radial_falloff[radial_distance >= radial_zero_radius] = 0.0
-    radial_falloff[radial_distance <= radial_full_radius] = 1.0
 
     frame_height_metres = (classes.shape[0] - 1) * pixel_size
     above_lake_metres = np.maximum(
@@ -242,9 +318,12 @@ def build_vertex_terrain(
         flat_vertex_mask=flat_vertex_mask,
         radial_falloff=radial_falloff.astype(np.float64),
         radial_distance=radial_distance.astype(np.float64),
+        radial_outer_radius=radial_outer_radius.astype(np.float64),
         healthy_centroid=healthy_centroid.astype(np.float64),
-        radial_full_radius=float(radial_full_radius),
-        radial_zero_radius=float(radial_zero_radius),
+        radial_semiaxes=radial_semiaxes.astype(np.float64),
+        radial_full_radius=float(RADIAL_INNER_FRACTION),
+        radial_zero_radius=1.0,
+        radial_noise_amplitude=float(radial_noise_amplitude),
         shoreline_ramp=shoreline_ramp.astype(np.float64),
         frame_height_metres=float(frame_height_metres),
         exaggeration=float(exaggeration),

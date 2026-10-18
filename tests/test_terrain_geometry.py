@@ -116,10 +116,30 @@ def test_lakebed_vertices_and_outer_boundary_are_exactly_flat() -> None:
     )
     assert np.all(geometry.flat_vertex_mask[lakebed_vertices])
     assert np.all(geometry.heights_world[lakebed_vertices] == 0.0)
-    outside = geometry.radial_distance >= geometry.radial_zero_radius
+    outside = geometry.radial_distance >= geometry.radial_outer_radius
     assert np.count_nonzero(outside) > 0
     assert np.all(geometry.radial_falloff[outside] == 0.0)
     assert np.all(geometry.heights_world[outside] == 0.0)
+
+
+def test_radial_falloff_is_seeded_broad_and_inside_inset() -> None:
+    mesh = np.load(MESH_PATH)
+    noisy = build_vertex_terrain(mesh["points"], exaggeration=2.0)
+    repeated = build_vertex_terrain(mesh["points"], exaggeration=2.0)
+    smooth = build_vertex_terrain(
+        mesh["points"],
+        exaggeration=2.0,
+        radial_noise_amplitude=0.0,
+    )
+    assert noisy.radial_full_radius == 0.45
+    assert noisy.radial_zero_radius == 1.0
+    assert noisy.radial_noise_amplitude == 0.12
+    assert np.array_equal(noisy.radial_falloff, repeated.radial_falloff)
+    assert not np.array_equal(noisy.radial_outer_radius, smooth.radial_outer_radius)
+    assert np.all(noisy.radial_outer_radius > 0.0)
+    active = noisy.radial_falloff > 0.0
+    assert np.all(mesh["points"][active] >= 0.03 - 1e-12)
+    assert np.all(mesh["points"][active] <= 0.97 + 1e-12)
 
 
 def test_source_tile_boundary_vertices_are_exactly_flat() -> None:
